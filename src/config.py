@@ -1,5 +1,5 @@
 # how many topics the system should extract
-NUM_TOPICS = 5
+NUM_TOPICS = 8
 
 # the 3 experimental conditions for how much expansion a preferred topic is allowed
 CONSTRAINT_DELTAS = [0.10, 0.15, 0.20]
