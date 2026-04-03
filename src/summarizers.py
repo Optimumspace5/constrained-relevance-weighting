@@ -2,7 +2,7 @@ import json
 import anthropic
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, UserPreference, SummarySegment, Summary
-from src.config import LLM_MODEL, MAX_SUMMARY_WORDS
+from src.config import LLM_MODEL, MAX_SUMMARY_WORDS, DEFAULT_DELTA
 
 load_dotenv()
 client = anthropic.Anthropic()
@@ -229,6 +229,175 @@ def generate_unconstrained_summary(
 
 
 # ---------------------------------------------------------------------------
+# Helper: calculate constrained proportions
+# ---------------------------------------------------------------------------
+
+def calculate_constrained_proportions(
+    topics: list[Topic],
+    preferences: list[UserPreference],
+    delta: float,
+) -> dict[str, float]:
+    """
+    Apply user preferences to topic proportions with a mathematical bound (delta).
+
+    The core idea of Constrained Relevance Weighting:
+    - Start with each topic's base proportion (how much of the episode it occupied).
+    - Multiply by the user's weight to get a raw target (e.g. high = *1.5).
+    - But clamp that target to [base - delta, base + delta] so no topic can be
+      expanded or compressed by more than `delta` percentage points.
+    - Also enforce a floor of 0.01 so every topic gets at least a 1% mention.
+    - Finally, normalize all clamped values so they sum to exactly 1.0.
+
+    Example with delta=0.15:
+      Topic A: base=0.40, weight=1.5 → raw=0.60, clamped to 0.40+0.15=0.55
+      Topic B: base=0.10, weight=0.5 → raw=0.05, clamped to 0.10-0.15=-0.05 → floor → 0.01
+      → then normalize so all sum to 1.0
+
+    Returns a dict mapping topic_name → constrained proportion (floats summing to 1.0).
+    """
+    pref_lookup = {p.topic_name: p.weight for p in preferences}
+
+    clamped: dict[str, float] = {}
+    for topic in topics:
+        base = topic.proportion
+        weight = pref_lookup.get(topic.name, 1.0)
+
+        # Step 1: apply the user's weight to get an unconstrained target.
+        raw_target = base * weight
+
+        # Step 2: clamp to within delta of the base proportion.
+        lower = base - delta
+        upper = base + delta
+        clamped_value = max(lower, min(raw_target, upper))
+
+        # Step 3: enforce a minimum of 0.01 — every topic gets at least a brief mention.
+        clamped_value = max(clamped_value, 0.01)
+
+        clamped[topic.name] = clamped_value
+
+    # Step 4: normalize so all proportions sum to 1.0.
+    total = sum(clamped.values())
+    return {name: value / total for name, value in clamped.items()}
+
+
+# ---------------------------------------------------------------------------
+# 3. generate_constrained_summary
+# ---------------------------------------------------------------------------
+
+def generate_constrained_summary(
+    segments: list[TranscriptSegment],
+    topics: list[Topic],
+    preferences: list[UserPreference],
+    delta: float = DEFAULT_DELTA,
+) -> Summary:
+    """
+    Generate a preference-driven summary with mathematically bounded topic proportions.
+
+    This is the full Constrained Relevance Weighting approach:
+    - User preferences shift topic proportions (like unconstrained).
+    - But the shift is capped at ±delta, so the summary stays anchored to the
+      episode's actual content — it can't wildly over-represent a minor topic.
+
+    The prompt shows Claude both the original proportion and the constrained target
+    so it understands the direction of the adjustment and the ceiling it must respect.
+    """
+
+    # Calculate the bounded target proportions for each topic.
+    constrained_proportions = calculate_constrained_proportions(topics, preferences, delta)
+    pref_lookup = {p.topic_name: p.weight for p in preferences}
+    weight_to_label = {1.5: "HIGH", 1.0: "MEDIUM", 0.5: "LOW"}
+
+    # --- Determine sample count per topic based on constrained proportion ---
+    # Topics with higher target proportions get more sample text in the prompt,
+    # giving Claude richer material to draw from for more detailed coverage.
+    # Scale: proportion >= 0.20 → 5 samples, >= 0.10 → 3, below → 1.
+    def samples_for_proportion(p: float) -> int:
+        if p >= 0.20:
+            return 5
+        if p >= 0.10:
+            return 3
+        return 1
+
+    # --- Build the topic + sample text block for the prompt ---
+    topic_blocks = []
+    for topic in topics:
+        original = topic.proportion
+        constrained = constrained_proportions[topic.name]
+        weight = pref_lookup.get(topic.name, 1.0)
+        label = weight_to_label.get(weight, "MEDIUM")
+        max_samples = samples_for_proportion(constrained)
+
+        sample_indices = _sample_topic_segments(topic, segments, max_samples=max_samples)
+        sample_texts = [segments[i].text for i in sample_indices]
+        combined = "\n---\n".join(sample_texts)
+
+        topic_blocks.append(
+            f"TOPIC: {topic.name} | User preference: {label}\n"
+            f"  Original proportion: {original:.1%}  →  Target proportion: {constrained:.1%}\n"
+            f"Description: {topic.description}\n"
+            f"Sample transcript text:\n{combined}"
+        )
+
+    topic_content = "\n\n".join(topic_blocks)
+
+    # --- System prompt: CRW framing ---
+    system_prompt = (
+        f"You are a personalized podcast summarizer using Constrained Relevance Weighting. "
+        f"Each topic has an ORIGINAL proportion (how much it appeared in the episode) and a "
+        f"TARGET proportion (adjusted for user preference within bounded limits). "
+        f"Cover each topic according to its TARGET proportion, but ensure every topic receives "
+        f"at least a brief mention. Do not fabricate information beyond what the transcript contains. "
+        f"All claims must be traceable to the provided transcript excerpts. "
+        f"Write in clear, flowing paragraphs. Target length: {MAX_SUMMARY_WORDS} words."
+    )
+
+    # --- User message ---
+    user_message = (
+        f"Here are the podcast topics with their original and target proportions.\n"
+        f"Allocate your summary words according to the TARGET proportion for each topic.\n\n"
+        f"{topic_content}"
+    )
+
+    # --- Call the API ---
+    try:
+        response = client.messages.create(
+            model=LLM_MODEL,
+            max_tokens=2048,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        summary_text = response.content[0].text.strip()
+    except Exception as e:
+        raise RuntimeError(f"API call failed in generate_constrained_summary: {e}") from e
+
+    # --- Build SummarySegment objects ---
+    summary_segments = []
+    for topic in topics:
+        summary_segments.append(SummarySegment(
+            text=summary_text,
+            source_segment_indices=topic.segment_indices,
+            topic_name=topic.name,
+        ))
+
+    word_count = len(summary_text.split())
+    prefs_dict = {p.topic_name: p.weight for p in preferences}
+    original_proportions = {t.name: t.proportion for t in topics}
+
+    return Summary(
+        segments=summary_segments,
+        summary_type="constrained",
+        metadata={
+            "word_count": word_count,
+            "num_topics": len(topics),
+            "delta": delta,
+            "preferences": prefs_dict,
+            "original_proportions": original_proportions,
+            "constrained_proportions": constrained_proportions,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Quick test
 # ---------------------------------------------------------------------------
 
@@ -240,8 +409,7 @@ if __name__ == "__main__":
     segments = load_transcript("data/transcripts/episode1.txt")
     topics = segment_transcript(segments)
 
-    # Build hardcoded test ratings so we don't need interactive CLI input.
-    # Rule: first 2 topics → high, next 3 → medium, rest → low.
+    # Build hardcoded test ratings — first 2 topics high, next 3 medium, rest low.
     test_ratings = {}
     for i, topic in enumerate(topics):
         if i < 2:
@@ -252,18 +420,38 @@ if __name__ == "__main__":
             test_ratings[topic.name] = "low"
 
     preferences = create_preferences(topics, test_ratings)
-    print("\nTest preferences:")
-    for pref in preferences:
-        print(f"  {pref.topic_name}: {pref.weight}")
 
-    # --- Generic summary (no preferences, proportional coverage) ---
+    # --- Comparison table: original vs constrained proportions ---
+    constrained_proportions = calculate_constrained_proportions(topics, preferences, DEFAULT_DELTA)
+    pref_lookup = {p.topic_name: p.weight for p in preferences}
+    weight_to_label = {1.5: "high", 1.0: "medium", 0.5: "low"}
+
+    print(f"\n--- Proportion comparison (delta={DEFAULT_DELTA}) ---")
+    print(f"  {'Topic':<35} {'Original':>9} {'Pref':>8} {'Target':>9}")
+    print(f"  {'-'*35} {'-'*9} {'-'*8} {'-'*9}")
+    for topic in topics:
+        label = weight_to_label.get(pref_lookup.get(topic.name, 1.0), "medium")
+        print(
+            f"  {topic.name:<35} "
+            f"{topic.proportion:>8.1%} "
+            f"{label:>8} "
+            f"{constrained_proportions[topic.name]:>8.1%}"
+        )
+
+    # --- Generic summary ---
     print("\nGenerating generic summary...")
     generic = generate_generic_summary(segments, topics)
     print(f"\n--- Generic Summary ({generic.metadata['word_count']} words) ---\n")
     print(generic.segments[0].text)
 
-    # --- Unconstrained summary (preferences override proportions) ---
+    # --- Unconstrained summary ---
     print("\nGenerating unconstrained summary...")
     unconstrained = generate_unconstrained_summary(segments, topics, preferences)
     print(f"\n--- Unconstrained Summary ({unconstrained.metadata['word_count']} words) ---\n")
     print(unconstrained.segments[0].text)
+
+    # --- Constrained summary ---
+    print("\nGenerating constrained summary...")
+    constrained = generate_constrained_summary(segments, topics, preferences)
+    print(f"\n--- Constrained Summary ({constrained.metadata['word_count']} words) ---\n")
+    print(constrained.segments[0].text)
