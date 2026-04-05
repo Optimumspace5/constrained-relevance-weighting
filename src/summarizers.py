@@ -21,6 +21,14 @@ def _sample_topic_segments(
     Pick up to `max_samples` segment indices spread across a topic's segments.
     Strategy: always take the first, last, and middle — this gives Claude
     a sense of how the topic begins, develops, and ends.
+
+    LIMITATION: This is a sampling strategy, not full coverage. Claude only sees
+    a subset of each topic's segments, meaning:
+    - Details in unsampled segments will not appear in the summary.
+    - Faithfulness evaluation is bounded by the same sample (Change 2/6 ensures
+      the evaluator checks against these exact segments, not different ones).
+    - Increasing max_samples improves coverage but increases prompt size and cost.
+    This trade-off is inherent to prompt-size-constrained LLM summarization.
     """
     indices = topic.segment_indices
     if not indices:
@@ -56,8 +64,10 @@ def generate_generic_summary(
 
     # --- Build the topic + sample text block for the prompt ---
     topic_blocks = []
+    sampled_indices: dict[str, list[int]] = {}   # track which segments were actually sent to Claude
     for topic in topics:
         sample_indices = _sample_topic_segments(topic, segments)
+        sampled_indices[topic.name] = sample_indices
         sample_texts = [segments[i].text for i in sample_indices]
 
         # Join samples with a separator so Claude can tell them apart.
@@ -118,6 +128,7 @@ def generate_generic_summary(
         metadata={
             "word_count": word_count,
             "num_topics": len(topics),
+            "sampled_indices": sampled_indices,
         },
     )
 
@@ -156,12 +167,14 @@ def generate_unconstrained_summary(
 
     # --- Build the topic + sample text block for the prompt ---
     topic_blocks = []
+    sampled_indices: dict[str, list[int]] = {}   # track which segments were actually sent to Claude
     for topic in topics:
         weight = pref_lookup.get(topic.name, 1.0)   # default to medium if missing
         label = weight_to_label.get(weight, "MEDIUM")
         max_samples = samples_by_weight.get(weight, 3)
 
         sample_indices = _sample_topic_segments(topic, segments, max_samples=max_samples)
+        sampled_indices[topic.name] = sample_indices
         sample_texts = [segments[i].text for i in sample_indices]
         combined = "\n---\n".join(sample_texts)
 
@@ -224,6 +237,7 @@ def generate_unconstrained_summary(
             "word_count": word_count,
             "num_topics": len(topics),
             "preferences": prefs_dict,
+            "sampled_indices": sampled_indices,
         },
     )
 
@@ -320,6 +334,7 @@ def generate_constrained_summary(
 
     # --- Build the topic + sample text block for the prompt ---
     topic_blocks = []
+    sampled_indices: dict[str, list[int]] = {}   # track which segments were actually sent to Claude
     for topic in topics:
         original = topic.proportion
         constrained = constrained_proportions[topic.name]
@@ -328,6 +343,7 @@ def generate_constrained_summary(
         max_samples = samples_for_proportion(constrained)
 
         sample_indices = _sample_topic_segments(topic, segments, max_samples=max_samples)
+        sampled_indices[topic.name] = sample_indices
         sample_texts = [segments[i].text for i in sample_indices]
         combined = "\n---\n".join(sample_texts)
 
@@ -393,6 +409,71 @@ def generate_constrained_summary(
             "preferences": prefs_dict,
             "original_proportions": original_proportions,
             "constrained_proportions": constrained_proportions,
+            "sampled_indices": sampled_indices,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. generate_baseline_summary (no LLM — pure extractive)
+# ---------------------------------------------------------------------------
+
+def generate_baseline_summary(
+    segments: list[TranscriptSegment],
+    topics: list[Topic],
+) -> Summary:
+    """
+    Generate a naive extractive baseline by pulling raw sentences from the transcript.
+
+    No LLM is used — this just takes the first N words from each topic's segments,
+    proportional to the topic's share of the episode. This provides a lower bound:
+    if LLM-generated summaries don't score better than this, something is wrong.
+
+    Approach:
+    - Allocate MAX_SUMMARY_WORDS across topics based on their proportions.
+    - For each topic, concatenate its segments' text and take the first allocated words.
+    - Build one SummarySegment per topic with exact source traceability.
+    """
+    topic_texts = []
+    summary_segments = []
+
+    for topic in topics:
+        # How many words this topic gets in the summary.
+        word_budget = int(MAX_SUMMARY_WORDS * topic.proportion)
+        word_budget = max(word_budget, 10)   # at least 10 words per topic
+
+        # Concatenate all of this topic's segment texts.
+        full_text = " ".join(segments[i].text for i in topic.segment_indices)
+
+        # Take the first word_budget words.
+        words = full_text.split()
+        extracted = " ".join(words[:word_budget])
+
+        # Track which segments contributed (all segments whose text was included).
+        used_indices = []
+        chars_used = 0
+        for idx in topic.segment_indices:
+            seg_len = len(segments[idx].text)
+            if chars_used < len(extracted):
+                used_indices.append(idx)
+            chars_used += seg_len + 1   # +1 for the space we joined with
+
+        topic_texts.append(f"**{topic.name}**: {extracted}")
+        summary_segments.append(SummarySegment(
+            text=extracted,
+            source_segment_indices=used_indices,
+            topic_name=topic.name,
+        ))
+
+    # Calculate total word count across all topic extracts.
+    word_count = sum(len(seg.text.split()) for seg in summary_segments)
+
+    return Summary(
+        segments=summary_segments,
+        summary_type="baseline",
+        metadata={
+            "word_count": word_count,
+            "num_topics": len(topics),
         },
     )
 

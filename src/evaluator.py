@@ -1,5 +1,6 @@
 import json
 import anthropic
+from rouge_score import rouge_scorer
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, UserPreference, Summary
 from src.config import LLM_MODEL
@@ -21,32 +22,34 @@ def evaluate_faithfulness(
 
     For each paragraph (SummarySegment), we send Claude:
     - The paragraph text
-    - Up to 5 source transcript excerpts (first 200 words each), spread across the topic
+    - The source segments that the summarizer actually used (from metadata["sampled_indices"])
 
     Claude rates support on a 1-5 scale and flags any unsupported claims.
     This catches hallucinations — things Claude may have said in the summary
     that aren't actually in the transcript.
+
+    KNOWN LIMITATIONS:
+    - LLM-as-judge: Claude is evaluating its own output, which introduces self-consistency
+      bias (it may rate its own phrasing as well-supported). ROUGE and extractive overlap
+      scores (compute_rouge_scores, compute_extractive_overlap) provide complementary
+      non-LLM metrics to cross-validate.
+    - Sampling: faithfulness is checked only against the sampled segments, not the full
+      transcript. Claims paraphrased from unsampled segments may be flagged as unsupported.
     """
     paragraph_scores = []
     issues = []
 
+    # Use the exact segments the summarizer sent to Claude, stored in metadata.
+    # This ensures faithfulness is checked against the same evidence the summary was built from,
+    # rather than re-sampling independently (which could pick different segments).
+    sampled_indices = summary.metadata.get("sampled_indices", {})
+
     for seg in summary.segments:
-        # Gather up to 5 source segments spread across the topic: first, 25%, middle, 75%, last.
-        # This mirrors the _sample_topic_segments strategy in summarizers.py — spreading the
-        # sample gives the faithfulness checker a better chance of finding the relevant text
-        # regardless of where in the topic the claim appears.
-        all_indices = seg.source_segment_indices if seg.source_segment_indices else []
-        if len(all_indices) <= 5:
-            source_indices = all_indices
-        else:
-            n = len(all_indices)
-            source_indices = list(dict.fromkeys([
-                all_indices[0],
-                all_indices[n // 4],
-                all_indices[n // 2],
-                all_indices[(3 * n) // 4],
-                all_indices[-1],
-            ]))
+        # Look up the segments that were actually used to generate this topic's summary.
+        # Falls back to source_segment_indices if sampled_indices isn't available (backwards compat).
+        source_indices = sampled_indices.get(seg.topic_name, [])
+        if not source_indices:
+            source_indices = seg.source_segment_indices[:5] if seg.source_segment_indices else []
 
         # Build the source excerpt block — first 200 words of each source segment.
         source_blocks = []
@@ -96,7 +99,126 @@ def evaluate_faithfulness(
 
 
 # ---------------------------------------------------------------------------
-# 2. evaluate_coverage
+# 2. compute_rouge_scores
+# ---------------------------------------------------------------------------
+
+def compute_rouge_scores(
+    summary: Summary,
+    segments: list[TranscriptSegment],
+) -> dict:
+    """
+    Compute ROUGE-1, ROUGE-2, and ROUGE-L between the summary and its source text.
+
+    Unlike the LLM-based faithfulness check, ROUGE is deterministic and reproducible.
+    It measures n-gram overlap: how many words/phrases from the source actually appear
+    in the summary. Higher scores indicate the summary is more grounded in the source.
+
+    - ROUGE-1: unigram overlap (individual word matches)
+    - ROUGE-2: bigram overlap (two-word phrase matches)
+    - ROUGE-L: longest common subsequence (captures sentence-level structure)
+
+    The source text is built from the segments the summarizer actually used (stored in
+    metadata["sampled_indices"]), falling back to all source_segment_indices if unavailable.
+    """
+    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+
+    # Build the reference text from the segments the summarizer actually saw.
+    sampled_indices = summary.metadata.get("sampled_indices", {})
+
+    # Collect all unique source segment indices across all topics.
+    all_source_indices: set[int] = set()
+    for seg in summary.segments:
+        topic_sampled = sampled_indices.get(seg.topic_name, [])
+        if topic_sampled:
+            all_source_indices.update(topic_sampled)
+        elif seg.source_segment_indices:
+            all_source_indices.update(seg.source_segment_indices)
+
+    # Join all source segment texts into one reference string.
+    reference_text = " ".join(
+        segments[i].text for i in sorted(all_source_indices) if i < len(segments)
+    )
+
+    # The summary text — use the first segment's text (all segments share the full text
+    # before evidence linking splits them into paragraphs).
+    summary_text = summary.segments[0].text if summary.segments else ""
+
+    scores = scorer.score(reference_text, summary_text)
+
+    return {
+        "rouge1": round(scores["rouge1"].fmeasure, 4),
+        "rouge2": round(scores["rouge2"].fmeasure, 4),
+        "rougeL": round(scores["rougeL"].fmeasure, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. compute_extractive_overlap
+# ---------------------------------------------------------------------------
+
+def compute_extractive_overlap(
+    summary: Summary,
+    segments: list[TranscriptSegment],
+) -> dict:
+    """
+    Measure what fraction of the summary's content is directly extracted from the source.
+
+    Unlike ROUGE (which is symmetric and uses F-measure), extractive overlap answers a
+    directional question: "of everything in the summary, how much came verbatim from
+    the transcript?" High overlap = the summary sticks close to the source wording.
+    Low overlap = the LLM paraphrased or potentially hallucinated.
+
+    Returns:
+    - unigram_overlap: fraction of summary words found in the source
+    - bigram_overlap: fraction of summary bigrams found in the source
+    """
+    # Build source text from the same segments the summarizer used.
+    sampled_indices = summary.metadata.get("sampled_indices", {})
+    all_source_indices: set[int] = set()
+    for seg in summary.segments:
+        topic_sampled = sampled_indices.get(seg.topic_name, [])
+        if topic_sampled:
+            all_source_indices.update(topic_sampled)
+        elif seg.source_segment_indices:
+            all_source_indices.update(seg.source_segment_indices)
+
+    source_text = " ".join(
+        segments[i].text for i in sorted(all_source_indices) if i < len(segments)
+    )
+    summary_text = summary.segments[0].text if summary.segments else ""
+
+    # Tokenize: lowercase and split on whitespace for simple word-level comparison.
+    source_words = source_text.lower().split()
+    summary_words = summary_text.lower().split()
+
+    if not summary_words:
+        return {"unigram_overlap": 0.0, "bigram_overlap": 0.0}
+
+    # Unigram overlap: what fraction of summary words appear in the source?
+    source_unigrams = set(source_words)
+    matching_unigrams = sum(1 for w in summary_words if w in source_unigrams)
+    unigram_overlap = matching_unigrams / len(summary_words)
+
+    # Bigram overlap: what fraction of summary bigrams appear in the source?
+    def bigrams(words: list[str]) -> list[tuple[str, str]]:
+        return [(words[i], words[i + 1]) for i in range(len(words) - 1)]
+
+    source_bigrams = set(bigrams(source_words))
+    summary_bigram_list = bigrams(summary_words)
+    if summary_bigram_list:
+        matching_bigrams = sum(1 for b in summary_bigram_list if b in source_bigrams)
+        bigram_overlap = matching_bigrams / len(summary_bigram_list)
+    else:
+        bigram_overlap = 0.0
+
+    return {
+        "unigram_overlap": round(unigram_overlap, 4),
+        "bigram_overlap": round(bigram_overlap, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. evaluate_coverage (no API call — pure set comparison)
 # ---------------------------------------------------------------------------
 
 def evaluate_coverage(summary: Summary, topics: list[Topic]) -> dict:
@@ -135,51 +257,73 @@ def evaluate_relevance(
     """
     Measure how well the summary's topic distribution matches user preferences.
 
-    Approach:
-    - Count paragraphs and words per topic in the summary.
-    - A high-preference topic should have more coverage than a low-preference one.
-    - Relevance score = sum(paragraph_count_for_topic * user_weight) / total_paragraphs
-      This rewards coverage of high-weight topics and penalises over-coverage of low-weight ones.
+    Approach (improved — uses word counts, not paragraph counts):
+    - Count words per topic in the summary to get actual word proportions.
+    - Relevance score = sum(topic_word_proportion * user_weight) across all topics.
+      This rewards giving more words to high-weight topics and fewer to low-weight ones.
+    - Proportion MAE = mean absolute error between the summary's actual topic proportions
+      and the target proportions (from calculate_constrained_proportions if available,
+      otherwise from the original topic proportions). Lower MAE = better adherence to targets.
     - topic_alignment flags whether each topic's coverage direction matched its preference
-      (e.g. high pref + above-average paragraphs = aligned).
+      (e.g. high pref + above-average word share = aligned).
     """
     pref_lookup = {p.topic_name: p.weight for p in preferences}
 
-    # Count paragraphs and words per topic in the summary.
-    para_count: dict[str, int] = {}
+    # Count words per topic in the summary.
     word_count: dict[str, int] = {}
     for seg in summary.segments:
         name = seg.topic_name
-        para_count[name] = para_count.get(name, 0) + 1
         word_count[name] = word_count.get(name, 0) + len(seg.text.split())
 
-    total_paragraphs = len(summary.segments)
+    total_words = sum(word_count.values())
 
-    # Relevance score: weight each paragraph by its topic's user weight.
+    # Compute actual word proportions in the summary.
+    actual_proportions: dict[str, float] = {}
+    for topic in topics:
+        words = word_count.get(topic.name, 0)
+        actual_proportions[topic.name] = words / total_words if total_words > 0 else 0.0
+
+    # Relevance score: weight each topic's word proportion by the user's preference weight.
     relevance_score = 0.0
-    if total_paragraphs > 0:
-        for topic_name, count in para_count.items():
-            weight = pref_lookup.get(topic_name, 1.0)
-            relevance_score += (count * weight) / total_paragraphs
+    for topic_name, proportion in actual_proportions.items():
+        weight = pref_lookup.get(topic_name, 1.0)
+        relevance_score += proportion * weight
+
+    # Proportion MAE: how far is the summary's actual distribution from the target?
+    # Use constrained_proportions from metadata if available (constrained summary),
+    # otherwise fall back to the original topic proportions (generic/unconstrained).
+    target_proportions = summary.metadata.get("constrained_proportions", {})
+    if not target_proportions:
+        target_proportions = {t.name: t.proportion for t in topics}
+
+    absolute_errors = []
+    for topic in topics:
+        actual = actual_proportions.get(topic.name, 0.0)
+        target = target_proportions.get(topic.name, 0.0)
+        absolute_errors.append(abs(actual - target))
+
+    proportion_mae = sum(absolute_errors) / len(absolute_errors) if absolute_errors else 0.0
 
     # topic_alignment: did coverage direction match preference direction?
-    # "Direction" = above or below the average paragraph count per topic.
-    avg_paragraphs = total_paragraphs / len({t.name for t in topics}) if topics else 1.0
+    # "Direction" = above or below the average word proportion per topic.
+    avg_proportion = 1.0 / len(topics) if topics else 1.0
 
     topic_alignment: dict[str, bool] = {}
     for topic in topics:
         weight = pref_lookup.get(topic.name, 1.0)
-        count = para_count.get(topic.name, 0)
-        # High pref (>1.0) → expect above-average paragraphs; low pref (<1.0) → below average.
+        proportion = actual_proportions.get(topic.name, 0.0)
+        # High pref (>1.0) → expect above-average proportion; low pref (<1.0) → below average.
         if weight > 1.0:
-            topic_alignment[topic.name] = count >= avg_paragraphs
+            topic_alignment[topic.name] = proportion >= avg_proportion
         elif weight < 1.0:
-            topic_alignment[topic.name] = count <= avg_paragraphs
+            topic_alignment[topic.name] = proportion <= avg_proportion
         else:
             topic_alignment[topic.name] = True   # medium = always aligned
 
     return {
         "relevance_score": round(relevance_score, 3),
+        "proportion_mae": round(proportion_mae, 4),
+        "actual_proportions": {k: round(v, 4) for k, v in actual_proportions.items()},
         "topic_alignment": topic_alignment,
     }
 
@@ -195,27 +339,33 @@ def run_full_evaluation(
     segments: list[TranscriptSegment],
     topics: list[Topic],
     preferences: list[UserPreference],
+    baseline: Summary | None = None,
 ) -> dict:
     """
-    Run all three evaluations on all three summary variants and print a comparison table.
+    Run all evaluations on all summary variants and print a comparison table.
 
     Returns the full nested results dict so callers (e.g. Streamlit) can display
-    any part of the data they want.
+    any part of the data they want. The optional baseline provides a lower bound.
     """
-    summaries = {
-        "generic": generic,
-        "unconstrained": unconstrained,
-        "constrained": constrained,
-    }
+    summaries = {}
+    if baseline is not None:
+        summaries["baseline"] = baseline
+    summaries["generic"] = generic
+    summaries["unconstrained"] = unconstrained
+    summaries["constrained"] = constrained
 
     results = {}
     for name, summary in summaries.items():
         print(f"  Evaluating {name} summary...")
         faithfulness = evaluate_faithfulness(summary, segments)
+        rouge        = compute_rouge_scores(summary, segments)
+        extractive   = compute_extractive_overlap(summary, segments)
         coverage     = evaluate_coverage(summary, topics)
         relevance    = evaluate_relevance(summary, preferences, topics)
         results[name] = {
             "faithfulness": faithfulness,
+            "rouge": rouge,
+            "extractive_overlap": extractive,
             "coverage": coverage,
             "relevance": relevance,
             "word_count": summary.metadata.get("word_count", 0),
@@ -223,14 +373,18 @@ def run_full_evaluation(
 
     # --- Print comparison table ---
     col_w = 15
-    print(f"\n{'Summary Type':<15} {'Faithfulness':>{col_w}} {'Coverage':>{col_w}} {'Relevance':>{col_w}} {'Word Count':>{col_w}}")
-    print("-" * (15 + col_w * 4 + 4))
+    print(f"\n{'Summary Type':<15} {'Faithfulness':>{col_w}} {'ROUGE-1':>{col_w}} {'ROUGE-L':>{col_w}} {'Ext. Overlap':>{col_w}} {'Coverage':>{col_w}} {'Relevance':>{col_w}} {'Prop. MAE':>{col_w}} {'Word Count':>{col_w}}")
+    print("-" * (15 + col_w * 8 + 8))
     for name, r in results.items():
         faith  = f"{r['faithfulness']['average_score']:.2f} / 5"
+        r1     = f"{r['rouge']['rouge1']:.4f}"
+        rl     = f"{r['rouge']['rougeL']:.4f}"
+        ext    = f"{r['extractive_overlap']['unigram_overlap']:.4f}"
         cov    = f"{r['coverage']['topics_covered']}/{r['coverage']['total_topics']} topics"
         rel    = f"{r['relevance']['relevance_score']:.3f}"
+        mae    = f"{r['relevance']['proportion_mae']:.4f}"
         words  = str(r["word_count"])
-        print(f"{name:<15} {faith:>{col_w}} {cov:>{col_w}} {rel:>{col_w}} {words:>{col_w}}")
+        print(f"{name:<15} {faith:>{col_w}} {r1:>{col_w}} {rl:>{col_w}} {ext:>{col_w}} {cov:>{col_w}} {rel:>{col_w}} {mae:>{col_w}} {words:>{col_w}}")
 
     return results
 

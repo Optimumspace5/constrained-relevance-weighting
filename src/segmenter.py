@@ -3,6 +3,10 @@ import anthropic
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic
 from src.config import LLM_MODEL, NUM_TOPICS
+# Does two things
+#1. Discover topics - what are the 8 main themes in this podcast
+#2. Classify segments - which segments does each chunk belong to
+# Analogy: Imagine you have a stack of 40 paragraphs from a podcast. This file is like hiring a librarian to first come up with 8 category labels, then sort every paragraph into the right category.
 
 # Load ANTHROPIC_API_KEY from .env into the environment so the Anthropic client can find it.
 load_dotenv()
@@ -21,14 +25,17 @@ def discover_topics(segments: list[TranscriptSegment], num_topics: int = NUM_TOP
     Ask Claude to identify the main topics in the transcript.
 
     To keep the prompt small we don't send the full transcript.
-    Instead we build a 'preview': the first 50 words of every 5th segment.
+    Instead we build a 'preview': the first 80 words of every 2nd segment.
     This gives Claude a representative sample spread across the whole episode.
+
+    LIMITATION: Topic discovery is based on a sampled preview, not the full text.
+    Rare topics that appear only in unsampled segments may be missed entirely.
 
     Returns a list of dicts, each with 'name' and 'description'.
     """
 
     # --- Build a condensed preview ---
-    # Take every 5th segment (indices 0, 5, 10, …) and grab the first 50 words.
+    # Take every 2nd segment (indices 0, 2, 4, …) and grab the first 80 words.
     preview_lines = []
     for i, seg in enumerate(segments):
         if i % 2 == 0:
