@@ -3,3 +3,9 @@ anthropic
 streamlit
 # for loading API key from the .env file
 python-dotenv
+# for ROUGE-based evaluation metrics (non-LLM faithfulness)
+rouge-score
+# for TF-IDF evidence linking (non-LLM similarity matching)
+scikit-learn
+# for unit tests
+pytest

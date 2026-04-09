@@ -1,5 +1,7 @@
 import json
 import anthropic
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, Summary, SummarySegment
 from src.config import LLM_MODEL
@@ -33,6 +35,10 @@ def link_evidence(
     3. Look up that topic's segment_indices.
     4. Return a new Summary with one SummarySegment per paragraph.
     """
+
+    # --- Baseline summaries already have per-topic segments; skip re-linking ---
+    if summary.summary_type == "baseline":
+        return summary
 
     # --- Step 1: split summary text into paragraphs ---
     # The summary is stored identically across all SummarySegments, so [0] is fine.
@@ -85,16 +91,66 @@ def link_evidence(
     # Build a classification lookup: paragraph_index → topic_name.
     para_to_topic = {item["paragraph_index"]: item["topic_name"] for item in classifications}
 
-    # --- Step 4: build fine-grained SummarySegment objects ---
+    # Get the sampled indices from metadata — these are the segments Claude actually saw.
+    sampled_indices = summary.metadata.get("sampled_indices", {})
+
+    # --- Step 4: claim-level evidence linking ---
+    # For each paragraph, ask Claude which specific source segments support it.
+    # This replaces the old approach of linking to ALL segments of the topic.
     new_segments = []
     for i, para_text in enumerate(paragraphs):
         topic_name = para_to_topic.get(i, topics[0].name)   # fall back to first topic if missing
         topic = topic_map.get(topic_name, topics[0])
 
+        # Use ALL of the topic's segments as candidates (not just sampled ones).
+        # This gives Claude a wider pool to find the best supporting evidence.
+        candidate_indices = topic.segment_indices
+
+        if len(candidate_indices) <= 1:
+            # Only one candidate — no need for a second API call.
+            linked_indices = candidate_indices
+        else:
+            # Build excerpts of each candidate segment for Claude to evaluate.
+            candidate_blocks = []
+            for idx in candidate_indices:
+                excerpt = " ".join(segments[idx].text.split()[:150])
+                candidate_blocks.append(f"[Segment {idx}]: {excerpt}")
+            candidate_text = "\n\n".join(candidate_blocks)
+
+            link_prompt = (
+                f"Which of the following source segments directly support this summary paragraph? "
+                f"Return ONLY a JSON array of the segment indices (ints) that contain evidence "
+                f"for the claims in the paragraph. If none are relevant, return an empty array.\n\n"
+                f"SUMMARY PARAGRAPH:\n{para_text}\n\n"
+                f"CANDIDATE SOURCE SEGMENTS:\n{candidate_text}"
+            )
+
+            try:
+                link_response = client.messages.create(
+                    model=LLM_MODEL,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": link_prompt}],
+                )
+                link_raw = link_response.content[0].text.strip()
+            except Exception:
+                # If the API call fails, fall back to all candidates.
+                linked_indices = candidate_indices
+            else:
+                link_raw = link_raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                try:
+                    linked_indices = json.loads(link_raw)
+                    # Validate: only keep indices that are in our candidate list.
+                    valid_set = set(candidate_indices)
+                    linked_indices = [idx for idx in linked_indices if idx in valid_set]
+                    if not linked_indices:
+                        linked_indices = candidate_indices   # fall back if Claude returned nothing valid
+                except (json.JSONDecodeError, TypeError):
+                    linked_indices = candidate_indices   # fall back on parse failure
+
         new_segments.append(SummarySegment(
             text=para_text,
             topic_name=topic_name,
-            source_segment_indices=topic.segment_indices,
+            source_segment_indices=linked_indices,
         ))
 
     # Return a new Summary — same type and metadata, but with paragraph-level segments.
@@ -107,7 +163,137 @@ def link_evidence(
 
 
 # ---------------------------------------------------------------------------
-# 2. format_evidence_report
+# 2. link_evidence_tfidf (no LLM — deterministic)
+# ---------------------------------------------------------------------------
+
+def link_evidence_tfidf(
+    summary: Summary,
+    segments: list[TranscriptSegment],
+    topics: list[Topic],
+    top_k: int = 3,
+) -> Summary:
+    """
+    Link summary paragraphs to source segments using TF-IDF cosine similarity.
+
+    Unlike link_evidence() which uses Claude to identify supporting segments,
+    this method is fully deterministic and requires no API calls. It computes
+    TF-IDF vectors for each summary paragraph and each candidate source segment,
+    then picks the top-k most similar source segments for each paragraph.
+
+    This provides a reproducible evidence link that can be compared against
+    the LLM-based linking to see how well they agree.
+
+    Args:
+        summary: The summary to link (can be pre- or post-evidence-linking).
+        segments: The full list of transcript segments.
+        topics: The discovered topics (used for topic classification).
+        top_k: How many source segments to link per paragraph (default: 3).
+    """
+    # Baseline summaries already have per-topic segments; skip re-linking.
+    if summary.summary_type == "baseline":
+        return summary
+
+    # Split summary into paragraphs (same as link_evidence).
+    full_text = summary.segments[0].text
+    paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
+
+    if not paragraphs:
+        return summary
+
+    # Build a topic lookup by segment index.
+    index_to_topic: dict[int, str] = {}
+    for topic in topics:
+        for idx in topic.segment_indices:
+            index_to_topic[idx] = topic.name
+
+    # Collect ALL candidate source segment indices (full topic segments, not sampled).
+    all_candidate_indices: list[int] = []
+    for topic in topics:
+        all_candidate_indices.extend(topic.segment_indices)
+    # Deduplicate while preserving order.
+    all_candidate_indices = list(dict.fromkeys(all_candidate_indices))
+
+    if not all_candidate_indices:
+        return summary
+
+    candidate_texts = [segments[i].text for i in all_candidate_indices]
+
+    # Build TF-IDF matrix over all paragraphs + all candidate segments together.
+    all_texts = paragraphs + candidate_texts
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(all_texts)
+
+    # Split the matrix: paragraphs are rows 0..len(paragraphs)-1,
+    # candidates are rows len(paragraphs)..end.
+    para_vectors = tfidf_matrix[:len(paragraphs)]
+    candidate_vectors = tfidf_matrix[len(paragraphs):]
+
+    # Compute cosine similarity between each paragraph and all candidates.
+    similarities = cosine_similarity(para_vectors, candidate_vectors)
+
+    # --- Step 1: classify each paragraph's topic by best-matching segment's topic ---
+    para_topics: list[str] = []
+    for i in range(len(paragraphs)):
+        best_pos = similarities[i].argmax()
+        para_topics.append(index_to_topic.get(all_candidate_indices[best_pos], topics[0].name))
+
+    # --- Step 2: for each paragraph, restrict candidates to its topic's segments ---
+    # Build per-topic candidate position sets for fast lookup.
+    topic_to_positions: dict[str, list[int]] = {}
+    for pos, idx in enumerate(all_candidate_indices):
+        t = index_to_topic.get(idx, "")
+        if t not in topic_to_positions:
+            topic_to_positions[t] = []
+        topic_to_positions[t].append(pos)
+
+    # Track how many times each segment has been linked (diversity penalty).
+    link_counts: dict[int, int] = {}
+
+    new_segments = []
+    for i, para_text in enumerate(paragraphs):
+        topic_name = para_topics[i]
+        # Get candidate positions for this paragraph's topic.
+        candidate_positions = topic_to_positions.get(topic_name, list(range(len(all_candidate_indices))))
+
+        # Score candidates within the topic, applying diversity penalty.
+        scored = []
+        for pos in candidate_positions:
+            sim = similarities[i][pos]
+            if sim <= 0:
+                continue
+            idx = all_candidate_indices[pos]
+            # Reduce score for segments already linked to other paragraphs.
+            penalty = 1.0 / (1 + link_counts.get(idx, 0))
+            scored.append((sim * penalty, idx))
+
+        scored.sort(reverse=True)
+        linked_indices = [idx for _, idx in scored[:top_k]]
+
+        if not linked_indices:
+            # Fallback: take the best global match.
+            best_pos = similarities[i].argmax()
+            linked_indices = [all_candidate_indices[best_pos]]
+
+        # Update link counts for diversity penalty.
+        for idx in linked_indices:
+            link_counts[idx] = link_counts.get(idx, 0) + 1
+
+        new_segments.append(SummarySegment(
+            text=para_text,
+            topic_name=topic_name,
+            source_segment_indices=linked_indices,
+        ))
+
+    updated_metadata = {**summary.metadata, "evidence_linked": True, "evidence_method": "tfidf"}
+    return Summary(
+        segments=new_segments,
+        summary_type=summary.summary_type,
+        metadata=updated_metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. format_evidence_report
 # ---------------------------------------------------------------------------
 
 def format_evidence_report(
@@ -147,7 +333,8 @@ def format_evidence_report(
                 source = segments[idx]
                 # First 100 words of the source segment.
                 excerpt = " ".join(source.text.split()[:100])
-                lines.append(f"  [Segment {idx}]: \"{excerpt}...\"")
+                ts_label = f" at {source.timestamp}" if source.timestamp else ""
+                lines.append(f"  [Segment {idx}{ts_label}]: \"{excerpt}...\"")
 
         lines.append("")   # blank line between paragraphs
 

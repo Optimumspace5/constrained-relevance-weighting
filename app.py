@@ -9,11 +9,13 @@ from src.summarizers import (
     generate_generic_summary,
     generate_unconstrained_summary,
     generate_constrained_summary,
+    generate_baseline_summary,
     calculate_constrained_proportions,
 )
-from src.evidence import link_evidence, format_evidence_report
+from src.evidence import link_evidence, link_evidence_tfidf, format_evidence_report
 from src.evaluator import run_full_evaluation
 from src.config import DEFAULT_DELTA, CONSTRAINT_DELTAS, PREFERENCE_WEIGHTS
+from src.profiles import PROFILES, PROFILE_DESCRIPTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -80,15 +82,35 @@ with st.sidebar:
         st.subheader("Your preferences")
         st.caption("How much detail do you want on each topic?")
 
+        # Profile preset — lets users quickly load a predefined preference pattern.
+        profile_names = ["(custom)"] + list(PROFILES.keys())
+        selected_profile = st.selectbox(
+            "Preset profile",
+            options=profile_names,
+            index=0,
+            help="Load a predefined preference pattern, or choose (custom) to set each topic manually.",
+        )
+
+        # If a preset is selected, apply it to generate default ratings.
+        if selected_profile != "(custom)":
+            preset_ratings = PROFILES[selected_profile](st.session_state.topics)
+            st.caption(f"_{PROFILE_DESCRIPTIONS[selected_profile]}_")
+        else:
+            preset_ratings = None
+
         # Collect a selectbox per topic; store ratings in a local dict.
         rating_options = list(PREFERENCE_WEIGHTS.keys())   # ["high", "medium", "low"]
         ratings: dict[str, str] = {}
         for topic in st.session_state.topics:
+            # Use the preset rating as default if a profile is selected.
+            default_rating = preset_ratings.get(topic.name, "medium") if preset_ratings else "medium"
+            default_index = rating_options.index(default_rating) if default_rating in rating_options else 1
+
             ratings[topic.name] = st.selectbox(
                 label=f"{topic.name} ({topic.proportion:.0%})",
                 options=rating_options,
-                index=rating_options.index("medium"),   # default to medium
-                key=f"rating_{topic.name}",
+                index=default_index,
+                key=f"rating_{topic.name}_{selected_profile}",
                 help=topic.description,
             )
 
@@ -111,6 +133,9 @@ with st.sidebar:
                 segments = st.session_state.segments
                 topics = st.session_state.topics
 
+                # Baseline is instant (no API call).
+                baseline = generate_baseline_summary(segments, topics)
+
                 with st.spinner("Generating generic summary..."):
                     generic = generate_generic_summary(segments, topics)
 
@@ -121,6 +146,7 @@ with st.sidebar:
                     constrained = generate_constrained_summary(segments, topics, preferences, delta=delta)
 
                 st.session_state.summaries = {
+                    "baseline": baseline,
                     "generic": generic,
                     "unconstrained": unconstrained,
                     "constrained": constrained,
@@ -161,16 +187,26 @@ weight_to_label = {v: k for k, v in PREFERENCE_WEIGHTS.items()}   # {1.5: "high"
 
 # Build table rows as a list of dicts — st.dataframe renders these cleanly.
 table_rows = []
+deviations = []
 for topic in topics:
     weight = pref_lookup.get(topic.name, 1.0)
+    original = topic.proportion
+    target = constrained_proportions[topic.name]
+    deviation = target - original
+    deviations.append(abs(deviation))
     table_rows.append({
         "Topic": topic.name,
-        "Original %": f"{topic.proportion:.1%}",
+        "Original %": f"{original:.1%}",
         "Preference": weight_to_label.get(weight, "medium"),
-        "Constrained Target %": f"{constrained_proportions[topic.name]:.1%}",
+        "Constrained Target %": f"{target:.1%}",
+        "Deviation": f"{deviation:+.1%}",
     })
 
 st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+# Show the mean absolute deviation as a summary metric.
+mae = sum(deviations) / len(deviations) if deviations else 0.0
+st.metric("Mean Absolute Deviation (MAE) from original proportions", f"{mae:.2%}")
 
 st.divider()
 
@@ -179,7 +215,15 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 st.subheader("Summaries")
-tab_generic, tab_unconstrained, tab_constrained = st.tabs(["Generic", "Unconstrained", "Constrained"])
+tab_baseline, tab_generic, tab_unconstrained, tab_constrained = st.tabs(
+    ["Baseline (extractive)", "Generic", "Unconstrained", "Constrained"]
+)
+
+with tab_baseline:
+    # Baseline has per-topic segments, so join them for display.
+    baseline_text = "\n\n".join(seg.text for seg in summaries["baseline"].segments)
+    st.markdown(baseline_text)
+    st.caption(f"Word count: {summaries['baseline'].metadata.get('word_count', '—')} · No LLM used")
 
 with tab_generic:
     summary_text = summaries["generic"].segments[0].text
@@ -218,13 +262,13 @@ def get_linked_summaries():
 # Evaluation expander
 # ---------------------------------------------------------------------------
 
-with st.expander("Evaluation — compare all three summaries"):
-    st.caption("Runs faithfulness (per-paragraph API calls), coverage, and relevance checks.")
+with st.expander("Evaluation — compare all summaries"):
+    st.caption("Runs QAGS (claim-level QA), LLM-as-judge faithfulness, coverage, relevance, ROUGE, and extractive overlap.")
 
     if st.button("Run Evaluation"):
         try:
             linked = get_linked_summaries()
-            with st.spinner("Evaluating... (multiple API calls)"):
+            with st.spinner("Evaluating... (this runs QAGS + LLM-as-judge — may take a minute)"):
                 results = run_full_evaluation(
                     linked["generic"],
                     linked["unconstrained"],
@@ -232,26 +276,59 @@ with st.expander("Evaluation — compare all three summaries"):
                     segments,
                     topics,
                     preferences,
+                    baseline=linked.get("baseline"),
                 )
 
             # Display results as a tidy table.
             eval_rows = []
             for name, r in results.items():
+                qags = r["qags"]
                 eval_rows.append({
                     "Summary": name,
+                    "QAGS Precision": f"{qags['supported_claims']}/{qags['total_claims']} ({qags['precision']:.0%})",
                     "Faithfulness (avg/5)": r["faithfulness"]["average_score"],
+                    "ROUGE-1": r["rouge"]["rouge1"],
+                    "ROUGE-L": r["rouge"]["rougeL"],
+                    "Extractive Overlap": r["extractive_overlap"]["unigram_overlap"],
                     "Coverage": f"{r['coverage']['topics_covered']}/{r['coverage']['total_topics']} topics",
                     "Relevance score": r["relevance"]["relevance_score"],
+                    "Proportion MAE": r["relevance"]["proportion_mae"],
                     "Word count": r["word_count"],
                 })
             st.dataframe(eval_rows, use_container_width=True, hide_index=True)
 
-            # Show any faithfulness issues flagged for the constrained summary.
+            # --- QAGS detail: unsupported claims ---
+            st.subheader("QAGS — unsupported claims")
+            for name in ["generic", "unconstrained", "constrained"]:
+                qags = results[name]["qags"]
+                unsupported = qags["unsupported"]
+                if unsupported:
+                    with st.expander(f"{name}: {len(unsupported)} unsupported claim(s)"):
+                        for claim in unsupported:
+                            st.markdown(f"- {claim}")
+                else:
+                    st.success(f"{name}: all {qags['total_claims']} claims supported")
+
+            # --- Per-topic QAGS comparison ---
+            st.subheader("Per-topic QAGS precision")
+            qags_topic_rows = []
+            for topic in topics:
+                row = {"Topic": topic.name}
+                for name in ["generic", "unconstrained", "constrained"]:
+                    tp = results[name]["qags"]["per_topic"].get(topic.name)
+                    if tp:
+                        row[name.capitalize()] = f"{tp['supported']}/{tp['total']} ({tp['precision']:.0%})"
+                    else:
+                        row[name.capitalize()] = "—"
+                qags_topic_rows.append(row)
+            st.dataframe(qags_topic_rows, use_container_width=True, hide_index=True)
+
+            # Show any LLM-as-judge faithfulness issues for reference.
             constrained_issues = results["constrained"]["faithfulness"]["issues"]
             if constrained_issues:
-                st.warning("Faithfulness issues in constrained summary:")
-                for issue in constrained_issues:
-                    st.markdown(f"- {issue}")
+                with st.expander("LLM-as-judge faithfulness issues (constrained)"):
+                    for issue in constrained_issues:
+                        st.markdown(f"- {issue}")
 
         except Exception as e:
             st.error(f"Evaluation failed: {e}")
@@ -264,10 +341,21 @@ with st.expander("Evaluation — compare all three summaries"):
 with st.expander("Evidence report — constrained summary"):
     st.caption("Shows each summary paragraph alongside the source transcript excerpts it came from.")
 
+    evidence_method = st.radio(
+        "Evidence linking method",
+        options=["LLM (Claude)", "TF-IDF (deterministic)"],
+        horizontal=True,
+        help="LLM uses Claude to identify supporting segments. TF-IDF uses cosine similarity — no API calls, fully reproducible.",
+    )
+
     if st.button("Generate Evidence Report"):
         try:
-            linked = get_linked_summaries()
-            report = format_evidence_report(linked["constrained"], segments)
+            if evidence_method == "TF-IDF (deterministic)":
+                linked_constrained = link_evidence_tfidf(summaries["constrained"], segments, topics)
+            else:
+                linked = get_linked_summaries()
+                linked_constrained = linked["constrained"]
+            report = format_evidence_report(linked_constrained, segments)
             st.text(report)   # st.text preserves the fixed-width formatting from format_evidence_report
         except Exception as e:
             st.error(f"Evidence report failed: {e}")

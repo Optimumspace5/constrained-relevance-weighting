@@ -20,6 +20,9 @@ class TranscriptSegment:
     end_index: int
     # how many words are in this chunk
     word_count: int
+    # the original timestamp from the transcript (e.g. "3:09"), if available.
+    # This is the timestamp of the first line that contributed to this chunk.
+    timestamp: str = ""
 
 # represents one discovered theme in the podcast
 @dataclass
