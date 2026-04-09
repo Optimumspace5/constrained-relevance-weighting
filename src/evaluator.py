@@ -38,6 +38,8 @@ def evaluate_faithfulness(
     """
     paragraph_scores = []
     issues = []
+    # Track per-topic scores for controlled comparison across summary types.
+    topic_scores: dict[str, list[int]] = {}
 
     # Use the exact segments the summarizer sent to Claude, stored in metadata.
     # This ensures faithfulness is checked against the same evidence the summary was built from,
@@ -49,7 +51,7 @@ def evaluate_faithfulness(
         # Falls back to source_segment_indices if sampled_indices isn't available (backwards compat).
         source_indices = sampled_indices.get(seg.topic_name, [])
         if not source_indices:
-            source_indices = seg.source_segment_indices[:5] if seg.source_segment_indices else []
+            source_indices = seg.source_segment_indices[:7] if seg.source_segment_indices else []
 
         # Build the source excerpt block — first 200 words of each source segment.
         source_blocks = []
@@ -85,16 +87,29 @@ def evaluate_faithfulness(
         except json.JSONDecodeError as e:
             raise ValueError(f"Could not parse faithfulness JSON:\n{raw}\nError: {e}") from e
 
-        paragraph_scores.append(result["score"])
+        score = result["score"]
+        paragraph_scores.append(score)
         if result.get("issues"):
             issues.append(result["issues"])
 
+        # Accumulate per-topic scores.
+        if seg.topic_name not in topic_scores:
+            topic_scores[seg.topic_name] = []
+        topic_scores[seg.topic_name].append(score)
+
     average_score = sum(paragraph_scores) / len(paragraph_scores) if paragraph_scores else 0.0
+
+    # Compute per-topic averages.
+    per_topic_avg = {
+        topic: round(sum(scores) / len(scores), 2)
+        for topic, scores in topic_scores.items()
+    }
 
     return {
         "paragraph_scores": paragraph_scores,
         "average_score": round(average_score, 2),
         "issues": issues,
+        "per_topic_scores": per_topic_avg,
     }
 
 
@@ -122,16 +137,12 @@ def compute_rouge_scores(
     """
     scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
 
-    # Build the reference text from the segments the summarizer actually saw.
-    sampled_indices = summary.metadata.get("sampled_indices", {})
-
-    # Collect all unique source segment indices across all topics.
+    # Build the reference text from ALL source segments (not just sampled ones).
+    # Using only sampled segments (3-5 excerpts) produces near-zero ROUGE scores
+    # because the reference is too small relative to the summary.
     all_source_indices: set[int] = set()
     for seg in summary.segments:
-        topic_sampled = sampled_indices.get(seg.topic_name, [])
-        if topic_sampled:
-            all_source_indices.update(topic_sampled)
-        elif seg.source_segment_indices:
+        if seg.source_segment_indices:
             all_source_indices.update(seg.source_segment_indices)
 
     # Join all source segment texts into one reference string.
@@ -139,9 +150,8 @@ def compute_rouge_scores(
         segments[i].text for i in sorted(all_source_indices) if i < len(segments)
     )
 
-    # The summary text — use the first segment's text (all segments share the full text
-    # before evidence linking splits them into paragraphs).
-    summary_text = summary.segments[0].text if summary.segments else ""
+    # The summary text — join all segment texts (handles both pre- and post-evidence-linking).
+    summary_text = " ".join(seg.text for seg in summary.segments) if summary.segments else ""
 
     scores = scorer.score(reference_text, summary_text)
 
@@ -172,20 +182,16 @@ def compute_extractive_overlap(
     - unigram_overlap: fraction of summary words found in the source
     - bigram_overlap: fraction of summary bigrams found in the source
     """
-    # Build source text from the same segments the summarizer used.
-    sampled_indices = summary.metadata.get("sampled_indices", {})
+    # Build source text from ALL source segments (not just sampled ones).
     all_source_indices: set[int] = set()
     for seg in summary.segments:
-        topic_sampled = sampled_indices.get(seg.topic_name, [])
-        if topic_sampled:
-            all_source_indices.update(topic_sampled)
-        elif seg.source_segment_indices:
+        if seg.source_segment_indices:
             all_source_indices.update(seg.source_segment_indices)
 
     source_text = " ".join(
         segments[i].text for i in sorted(all_source_indices) if i < len(segments)
     )
-    summary_text = summary.segments[0].text if summary.segments else ""
+    summary_text = " ".join(seg.text for seg in summary.segments) if summary.segments else ""
 
     # Tokenize: lowercase and split on whitespace for simple word-level comparison.
     source_words = source_text.lower().split()
@@ -329,7 +335,160 @@ def evaluate_relevance(
 
 
 # ---------------------------------------------------------------------------
-# 4. run_full_evaluation
+# 4. evaluate_faithfulness_qa  (QAGS-inspired, claim-level)
+# ---------------------------------------------------------------------------
+
+def evaluate_faithfulness_qa(
+    summary: Summary,
+    segments: list[TranscriptSegment],
+) -> dict:
+    """
+    QA-based faithfulness evaluation inspired by QAGS (Wang, Cho & Lewis, 2020).
+
+    Instead of asking Claude to subjectively rate faithfulness 1-5, this method:
+    1. Extracts atomic factual claims from each summary paragraph.
+    2. For each claim, generates a yes/no question.
+    3. Answers the question using ONLY the source transcript segments.
+    4. If the source can confirm the claim, it's "supported". Otherwise "unsupported".
+
+    This is more stable than LLM-as-judge because the task is constrained:
+    answering factual yes/no questions has far less variance than subjective rating.
+
+    Returns:
+        - total_claims: how many factual claims were extracted
+        - supported_claims: how many were confirmed by the source
+        - precision: supported / total (the faithfulness score)
+        - unsupported: list of claims that could not be verified
+        - per_topic: dict of topic_name → {total, supported, precision}
+    """
+    # Get the sampled indices so we check against the same evidence the summary used.
+    sampled_indices = summary.metadata.get("sampled_indices", {})
+
+    all_claims = []          # list of (claim_text, topic_name, is_supported)
+    per_topic: dict[str, dict] = {}
+
+    for seg in summary.segments:
+        # --- Step 1: Extract atomic claims from this paragraph ---
+        source_indices = sampled_indices.get(seg.topic_name, [])
+        if not source_indices:
+            source_indices = seg.source_segment_indices[:10] if seg.source_segment_indices else []
+
+        extract_prompt = (
+            "Extract every distinct factual claim from this summary paragraph. "
+            "Each claim should be a single, specific, verifiable statement. "
+            "Return ONLY a JSON array of strings — one claim per element. "
+            "Do not include opinions, transitions, or vague statements.\n\n"
+            f"PARAGRAPH:\n{seg.text}"
+        )
+
+        try:
+            response = client.messages.create(
+                model=LLM_MODEL,
+                max_tokens=512,
+                messages=[{"role": "user", "content": extract_prompt}],
+            )
+            raw = response.content[0].text.strip()
+        except Exception as e:
+            raise RuntimeError(f"API call failed in QAGS claim extraction: {e}") from e
+
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            claims = json.loads(raw)
+        except json.JSONDecodeError:
+            # If parsing fails, treat the whole paragraph as one claim.
+            claims = [seg.text]
+
+        if not claims:
+            continue
+
+        # --- Step 2: Build source text for verification ---
+        source_blocks = []
+        for idx in source_indices:
+            if idx < len(segments):
+                excerpt = " ".join(segments[idx].text.split()[:200])
+                source_blocks.append(f"[Segment {idx}]: {excerpt}")
+        source_text = "\n\n".join(source_blocks) if source_blocks else "(no source segments)"
+
+        # --- Step 3: Verify each claim against the source ---
+        # Batch all claims into one API call for efficiency.
+        claims_numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(claims))
+
+        verify_prompt = (
+            "For each numbered claim below, determine whether it is SUPPORTED or UNSUPPORTED "
+            "based ONLY on the source transcript excerpts provided. "
+            "A claim is SUPPORTED if the source contains evidence that directly confirms it. "
+            "A claim is UNSUPPORTED if the source does not contain enough evidence to confirm it, "
+            "even if you personally know it to be true from other sources. "
+            "Return ONLY a JSON array of objects with 'claim_index' (int, 1-based) "
+            "and 'verdict' (string: 'supported' or 'unsupported'). No other text.\n\n"
+            f"CLAIMS:\n{claims_numbered}\n\n"
+            f"SOURCE TRANSCRIPT EXCERPTS:\n{source_text}"
+        )
+
+        try:
+            response = client.messages.create(
+                model=LLM_MODEL,
+                max_tokens=512,
+                messages=[{"role": "user", "content": verify_prompt}],
+            )
+            raw = response.content[0].text.strip()
+        except Exception as e:
+            raise RuntimeError(f"API call failed in QAGS verification: {e}") from e
+
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            verdicts = json.loads(raw)
+        except json.JSONDecodeError:
+            # If parsing fails, conservatively mark all as unsupported.
+            verdicts = [{"claim_index": i+1, "verdict": "unsupported"} for i in range(len(claims))]
+
+        # Build a lookup of verdicts.
+        verdict_map = {v["claim_index"]: v["verdict"] for v in verdicts}
+
+        # Record results.
+        topic_name = seg.topic_name
+        if topic_name not in per_topic:
+            per_topic[topic_name] = {"total": 0, "supported": 0, "unsupported_claims": []}
+
+        for i, claim in enumerate(claims):
+            verdict = verdict_map.get(i + 1, "unsupported")
+            is_supported = verdict.lower() == "supported"
+            all_claims.append((claim, topic_name, is_supported))
+            per_topic[topic_name]["total"] += 1
+            if is_supported:
+                per_topic[topic_name]["supported"] += 1
+            else:
+                per_topic[topic_name]["unsupported_claims"].append(claim)
+
+    # Compute aggregate scores.
+    total_claims = len(all_claims)
+    supported_claims = sum(1 for _, _, s in all_claims if s)
+    precision = supported_claims / total_claims if total_claims > 0 else 0.0
+
+    unsupported = [claim for claim, _, s in all_claims if not s]
+
+    # Per-topic precision.
+    per_topic_precision = {}
+    for topic_name, data in per_topic.items():
+        t = data["total"]
+        per_topic_precision[topic_name] = {
+            "total": t,
+            "supported": data["supported"],
+            "precision": round(data["supported"] / t, 3) if t > 0 else 0.0,
+            "unsupported_claims": data["unsupported_claims"],
+        }
+
+    return {
+        "total_claims": total_claims,
+        "supported_claims": supported_claims,
+        "precision": round(precision, 3),
+        "unsupported": unsupported,
+        "per_topic": per_topic_precision,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. run_full_evaluation
 # ---------------------------------------------------------------------------
 
 def run_full_evaluation(
@@ -358,12 +517,15 @@ def run_full_evaluation(
     for name, summary in summaries.items():
         print(f"  Evaluating {name} summary...")
         faithfulness = evaluate_faithfulness(summary, segments)
+        print(f"    Running QAGS for {name}...")
+        qags         = evaluate_faithfulness_qa(summary, segments)
         rouge        = compute_rouge_scores(summary, segments)
         extractive   = compute_extractive_overlap(summary, segments)
         coverage     = evaluate_coverage(summary, topics)
         relevance    = evaluate_relevance(summary, preferences, topics)
         results[name] = {
             "faithfulness": faithfulness,
+            "qags": qags,
             "rouge": rouge,
             "extractive_overlap": extractive,
             "coverage": coverage,
@@ -373,10 +535,11 @@ def run_full_evaluation(
 
     # --- Print comparison table ---
     col_w = 15
-    print(f"\n{'Summary Type':<15} {'Faithfulness':>{col_w}} {'ROUGE-1':>{col_w}} {'ROUGE-L':>{col_w}} {'Ext. Overlap':>{col_w}} {'Coverage':>{col_w}} {'Relevance':>{col_w}} {'Prop. MAE':>{col_w}} {'Word Count':>{col_w}}")
-    print("-" * (15 + col_w * 8 + 8))
+    print(f"\n{'Summary Type':<15} {'Faith(1-5)':>{col_w}} {'QAGS Prec.':>{col_w}} {'ROUGE-1':>{col_w}} {'ROUGE-L':>{col_w}} {'Ext. Overlap':>{col_w}} {'Coverage':>{col_w}} {'Relevance':>{col_w}} {'Prop. MAE':>{col_w}} {'Words':>{col_w}}")
+    print("-" * (15 + col_w * 9 + 9))
     for name, r in results.items():
         faith  = f"{r['faithfulness']['average_score']:.2f} / 5"
+        qags_p = f"{r['qags']['supported_claims']}/{r['qags']['total_claims']} ({r['qags']['precision']:.0%})"
         r1     = f"{r['rouge']['rouge1']:.4f}"
         rl     = f"{r['rouge']['rougeL']:.4f}"
         ext    = f"{r['extractive_overlap']['unigram_overlap']:.4f}"
@@ -384,7 +547,7 @@ def run_full_evaluation(
         rel    = f"{r['relevance']['relevance_score']:.3f}"
         mae    = f"{r['relevance']['proportion_mae']:.4f}"
         words  = str(r["word_count"])
-        print(f"{name:<15} {faith:>{col_w}} {r1:>{col_w}} {rl:>{col_w}} {ext:>{col_w}} {cov:>{col_w}} {rel:>{col_w}} {mae:>{col_w}} {words:>{col_w}}")
+        print(f"{name:<15} {faith:>{col_w}} {qags_p:>{col_w}} {r1:>{col_w}} {rl:>{col_w}} {ext:>{col_w}} {cov:>{col_w}} {rel:>{col_w}} {mae:>{col_w}} {words:>{col_w}}")
 
     return results
 

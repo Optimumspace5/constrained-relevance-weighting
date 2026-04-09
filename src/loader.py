@@ -8,12 +8,18 @@ from src.models import TranscriptSegment
 #   Part 1 (M:SS):  e.g. "1:03"
 #   Part 2 (spoken time glued to next word): e.g. "1 minute, 3 secondsBut"
 # Combined they look like: "1:031 minute, 3 secondsBut"
-# This regex matches the entire prefix up to and including "seconds".
+# This regex matches the entire prefix up to and including "second(s)".
 _TIMESTAMP_RE = re.compile(
-    r'^\d+:\d+'           # M:SS clock stamp (e.g. "1:03")
-    r'\d+'                # display number stuck on with no space (e.g. "1" → "1 minute")
-    r'(?:\s+minutes?,\s*\d+)?'  # optional " minute(s), NN" for >=1-minute marks
-    r'\s+seconds?'        # " second(s)" always present
+    r'^\d+:\d+'           # M:SS or H:MM:SS clock stamp (e.g. "1:03", "1:00:06")
+    r'(?::\d+)?'          # optional extra :SS for H:MM:SS format
+    r'\d+'                # display number stuck on with no space (e.g. "1" → "1 hour/minute")
+    r'(?:\s+hours?'       # optional " hour(s)" block for >=1-hour marks
+    r'(?:,\s*\d+)?'       #   optional ", NN" (the minutes number after hours)
+    r')?'                 # close the hours group
+    r'(?:\s+minutes?'     # optional " minute(s)" block for >=1-minute marks
+    r'(?:,\s*\d+)?'       #   optional ", NN" (the seconds number after minutes)
+    r')?'                 # close the minutes group
+    r'(?:\s+seconds?)?'   # optional " second(s)" — absent on exact-minute marks like 15:00
 )
 
 # Sound artifacts inserted by YouTube's auto-captioner: [music], [snorts], [applause], etc.
@@ -22,9 +28,9 @@ _ARTIFACT_RE = re.compile(r'\[.*?\]')
 # Collapse runs of whitespace (including newlines) to a single space.
 _WHITESPACE_RE = re.compile(r'\s+')
 
-# Extract just the M:SS clock portion from the start of a timestamped line.
-# M:SS = one or more digits, colon, exactly two digits (e.g. "1:03", "12:45").
-_CLOCK_RE = re.compile(r'^(\d+:\d{2})')
+# Extract just the clock portion from the start of a timestamped line.
+# Handles both M:SS (e.g. "1:03") and H:MM:SS (e.g. "1:00:06").
+_CLOCK_RE = re.compile(r'^(\d+:\d{2}(?::\d{2})?)')
 
 # Sentence boundary: period, exclamation, or question mark followed by a space or end-of-string.
 _SENTENCE_END_RE = re.compile(r'(?<=[.!?])\s+')

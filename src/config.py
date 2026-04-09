@@ -13,5 +13,7 @@ PREFERENCE_WEIGHTS = {
 }
 # which claude model to use for generation
 LLM_MODEL = "claude-sonnet-4-20250514"
-# target summary length
-MAX_SUMMARY_WORDS = 800
+# target summary length — all summaries must land in this range for fair comparison
+MAX_SUMMARY_WORDS = 900          # target midpoint
+MIN_SUMMARY_WORDS = 800          # hard floor
+MAX_SUMMARY_WORDS_CEIL = 1000    # hard ceiling

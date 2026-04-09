@@ -36,6 +36,10 @@ def link_evidence(
     4. Return a new Summary with one SummarySegment per paragraph.
     """
 
+    # --- Baseline summaries already have per-topic segments; skip re-linking ---
+    if summary.summary_type == "baseline":
+        return summary
+
     # --- Step 1: split summary text into paragraphs ---
     # The summary is stored identically across all SummarySegments, so [0] is fine.
     full_text = summary.segments[0].text
@@ -98,10 +102,9 @@ def link_evidence(
         topic_name = para_to_topic.get(i, topics[0].name)   # fall back to first topic if missing
         topic = topic_map.get(topic_name, topics[0])
 
-        # Get the candidate source segments for this topic.
-        # Prefer sampled_indices (what the summarizer actually sent to Claude),
-        # fall back to all topic segments if sampled_indices isn't available.
-        candidate_indices = sampled_indices.get(topic_name, topic.segment_indices)
+        # Use ALL of the topic's segments as candidates (not just sampled ones).
+        # This gives Claude a wider pool to find the best supporting evidence.
+        candidate_indices = topic.segment_indices
 
         if len(candidate_indices) <= 1:
             # Only one candidate — no need for a second API call.
@@ -186,6 +189,10 @@ def link_evidence_tfidf(
         topics: The discovered topics (used for topic classification).
         top_k: How many source segments to link per paragraph (default: 3).
     """
+    # Baseline summaries already have per-topic segments; skip re-linking.
+    if summary.summary_type == "baseline":
+        return summary
+
     # Split summary into paragraphs (same as link_evidence).
     full_text = summary.segments[0].text
     paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
@@ -193,14 +200,16 @@ def link_evidence_tfidf(
     if not paragraphs:
         return summary
 
-    # Get the sampled indices from metadata.
-    sampled_indices = summary.metadata.get("sampled_indices", {})
+    # Build a topic lookup by segment index.
+    index_to_topic: dict[int, str] = {}
+    for topic in topics:
+        for idx in topic.segment_indices:
+            index_to_topic[idx] = topic.name
 
-    # Collect ALL candidate source segment indices and their texts.
+    # Collect ALL candidate source segment indices (full topic segments, not sampled).
     all_candidate_indices: list[int] = []
     for topic in topics:
-        candidates = sampled_indices.get(topic.name, topic.segment_indices)
-        all_candidate_indices.extend(candidates)
+        all_candidate_indices.extend(topic.segment_indices)
     # Deduplicate while preserving order.
     all_candidate_indices = list(dict.fromkeys(all_candidate_indices))
 
@@ -222,29 +231,52 @@ def link_evidence_tfidf(
     # Compute cosine similarity between each paragraph and all candidates.
     similarities = cosine_similarity(para_vectors, candidate_vectors)
 
-    # For topic classification, build a simple topic lookup by segment index.
-    index_to_topic: dict[int, str] = {}
-    for topic in topics:
-        for idx in topic.segment_indices:
-            index_to_topic[idx] = topic.name
+    # --- Step 1: classify each paragraph's topic by best-matching segment's topic ---
+    para_topics: list[str] = []
+    for i in range(len(paragraphs)):
+        best_pos = similarities[i].argmax()
+        para_topics.append(index_to_topic.get(all_candidate_indices[best_pos], topics[0].name))
 
-    # Build new SummarySegments with TF-IDF-based evidence links.
+    # --- Step 2: for each paragraph, restrict candidates to its topic's segments ---
+    # Build per-topic candidate position sets for fast lookup.
+    topic_to_positions: dict[str, list[int]] = {}
+    for pos, idx in enumerate(all_candidate_indices):
+        t = index_to_topic.get(idx, "")
+        if t not in topic_to_positions:
+            topic_to_positions[t] = []
+        topic_to_positions[t].append(pos)
+
+    # Track how many times each segment has been linked (diversity penalty).
+    link_counts: dict[int, int] = {}
+
     new_segments = []
     for i, para_text in enumerate(paragraphs):
-        # Get the top-k most similar candidate indices.
-        sim_scores = similarities[i]
-        top_k_positions = sim_scores.argsort()[-top_k:][::-1]
-        linked_indices = [all_candidate_indices[pos] for pos in top_k_positions if sim_scores[pos] > 0]
+        topic_name = para_topics[i]
+        # Get candidate positions for this paragraph's topic.
+        candidate_positions = topic_to_positions.get(topic_name, list(range(len(all_candidate_indices))))
+
+        # Score candidates within the topic, applying diversity penalty.
+        scored = []
+        for pos in candidate_positions:
+            sim = similarities[i][pos]
+            if sim <= 0:
+                continue
+            idx = all_candidate_indices[pos]
+            # Reduce score for segments already linked to other paragraphs.
+            penalty = 1.0 / (1 + link_counts.get(idx, 0))
+            scored.append((sim * penalty, idx))
+
+        scored.sort(reverse=True)
+        linked_indices = [idx for _, idx in scored[:top_k]]
 
         if not linked_indices:
-            linked_indices = all_candidate_indices[:1]   # fallback to first candidate
+            # Fallback: take the best global match.
+            best_pos = similarities[i].argmax()
+            linked_indices = [all_candidate_indices[best_pos]]
 
-        # Determine topic by majority vote of linked segments.
-        topic_votes: dict[str, int] = {}
+        # Update link counts for diversity penalty.
         for idx in linked_indices:
-            t = index_to_topic.get(idx, topics[0].name)
-            topic_votes[t] = topic_votes.get(t, 0) + 1
-        topic_name = max(topic_votes, key=topic_votes.get)
+            link_counts[idx] = link_counts.get(idx, 0) + 1
 
         new_segments.append(SummarySegment(
             text=para_text,

@@ -180,3 +180,49 @@ class TestEdgeCases:
         result = calculate_constrained_proportions(topics, prefs, delta=0.15)
         # A gets boosted, B stays at base → A should be larger.
         assert result["A"] > result["B"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Delta guarantee: final proportions stay within [base ± delta]
+# ---------------------------------------------------------------------------
+
+class TestDeltaGuarantee:
+    """Verify that normalization does NOT push any topic beyond its delta bound."""
+
+    def test_skewed_high_respects_delta(self):
+        """Scenario that triggered the original bug: 2 high + 6 low with delta=0.15."""
+        topics = make_topics({
+            "A": 0.177, "B": 0.045,
+            "C": 0.054, "D": 0.102, "E": 0.166,
+            "F": 0.162, "G": 0.148, "H": 0.147,
+        })
+        prefs = make_preferences({
+            "A": 1.5, "B": 1.5,
+            "C": 0.5, "D": 0.5, "E": 0.5,
+            "F": 0.5, "G": 0.5, "H": 0.5,
+        })
+        delta = 0.15
+        result = calculate_constrained_proportions(topics, prefs, delta)
+
+        for name, prop in result.items():
+            base = {"A": 0.177, "B": 0.045, "C": 0.054, "D": 0.102,
+                    "E": 0.166, "F": 0.162, "G": 0.148, "H": 0.147}[name]
+            deviation = abs(prop - base)
+            assert deviation <= delta + 1e-9, (
+                f"{name}: base={base:.3f}, final={prop:.3f}, "
+                f"deviation={deviation:.3f} exceeds delta={delta}"
+            )
+
+    def test_all_deltas_respected(self):
+        """Sweep multiple delta values and verify the guarantee holds."""
+        topics = make_topics({"A": 0.40, "B": 0.10, "C": 0.30, "D": 0.20})
+        prefs = make_preferences({"A": 1.5, "B": 1.5, "C": 0.5, "D": 0.5})
+        bases = {"A": 0.40, "B": 0.10, "C": 0.30, "D": 0.20}
+
+        for delta in [0.05, 0.10, 0.15, 0.20, 0.25]:
+            result = calculate_constrained_proportions(topics, prefs, delta)
+            for name, prop in result.items():
+                deviation = abs(prop - bases[name])
+                assert deviation <= delta + 1e-6, (
+                    f"delta={delta}, {name}: deviation={deviation:.4f}"
+                )

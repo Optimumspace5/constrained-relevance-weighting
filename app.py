@@ -263,12 +263,12 @@ def get_linked_summaries():
 # ---------------------------------------------------------------------------
 
 with st.expander("Evaluation — compare all summaries"):
-    st.caption("Runs faithfulness (per-paragraph API calls), coverage, relevance, ROUGE, and extractive overlap checks.")
+    st.caption("Runs QAGS (claim-level QA), LLM-as-judge faithfulness, coverage, relevance, ROUGE, and extractive overlap.")
 
     if st.button("Run Evaluation"):
         try:
             linked = get_linked_summaries()
-            with st.spinner("Evaluating... (multiple API calls)"):
+            with st.spinner("Evaluating... (this runs QAGS + LLM-as-judge — may take a minute)"):
                 results = run_full_evaluation(
                     linked["generic"],
                     linked["unconstrained"],
@@ -282,8 +282,10 @@ with st.expander("Evaluation — compare all summaries"):
             # Display results as a tidy table.
             eval_rows = []
             for name, r in results.items():
+                qags = r["qags"]
                 eval_rows.append({
                     "Summary": name,
+                    "QAGS Precision": f"{qags['supported_claims']}/{qags['total_claims']} ({qags['precision']:.0%})",
                     "Faithfulness (avg/5)": r["faithfulness"]["average_score"],
                     "ROUGE-1": r["rouge"]["rouge1"],
                     "ROUGE-L": r["rouge"]["rougeL"],
@@ -295,12 +297,38 @@ with st.expander("Evaluation — compare all summaries"):
                 })
             st.dataframe(eval_rows, use_container_width=True, hide_index=True)
 
-            # Show any faithfulness issues flagged for the constrained summary.
+            # --- QAGS detail: unsupported claims ---
+            st.subheader("QAGS — unsupported claims")
+            for name in ["generic", "unconstrained", "constrained"]:
+                qags = results[name]["qags"]
+                unsupported = qags["unsupported"]
+                if unsupported:
+                    with st.expander(f"{name}: {len(unsupported)} unsupported claim(s)"):
+                        for claim in unsupported:
+                            st.markdown(f"- {claim}")
+                else:
+                    st.success(f"{name}: all {qags['total_claims']} claims supported")
+
+            # --- Per-topic QAGS comparison ---
+            st.subheader("Per-topic QAGS precision")
+            qags_topic_rows = []
+            for topic in topics:
+                row = {"Topic": topic.name}
+                for name in ["generic", "unconstrained", "constrained"]:
+                    tp = results[name]["qags"]["per_topic"].get(topic.name)
+                    if tp:
+                        row[name.capitalize()] = f"{tp['supported']}/{tp['total']} ({tp['precision']:.0%})"
+                    else:
+                        row[name.capitalize()] = "—"
+                qags_topic_rows.append(row)
+            st.dataframe(qags_topic_rows, use_container_width=True, hide_index=True)
+
+            # Show any LLM-as-judge faithfulness issues for reference.
             constrained_issues = results["constrained"]["faithfulness"]["issues"]
             if constrained_issues:
-                st.warning("Faithfulness issues in constrained summary:")
-                for issue in constrained_issues:
-                    st.markdown(f"- {issue}")
+                with st.expander("LLM-as-judge faithfulness issues (constrained)"):
+                    for issue in constrained_issues:
+                        st.markdown(f"- {issue}")
 
         except Exception as e:
             st.error(f"Evaluation failed: {e}")

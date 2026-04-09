@@ -2,7 +2,7 @@ import json
 import anthropic
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, UserPreference, SummarySegment, Summary
-from src.config import LLM_MODEL, MAX_SUMMARY_WORDS, DEFAULT_DELTA
+from src.config import LLM_MODEL, MAX_SUMMARY_WORDS, MIN_SUMMARY_WORDS, MAX_SUMMARY_WORDS_CEIL, DEFAULT_DELTA
 
 load_dotenv()
 client = anthropic.Anthropic()
@@ -15,18 +15,18 @@ client = anthropic.Anthropic()
 def _sample_topic_segments(
     topic: Topic,
     segments: list[TranscriptSegment],
-    max_samples: int = 3,
+    max_samples: int = 5,
 ) -> list[int]:
     """
-    Pick up to `max_samples` segment indices spread across a topic's segments.
-    Strategy: always take the first, last, and middle — this gives Claude
-    a sense of how the topic begins, develops, and ends.
+    Pick up to `max_samples` segment indices evenly spread across a topic's segments.
+    Strategy: divide the segment list into `max_samples` equal slices and pick one
+    from each slice. This ensures coverage spans the full range of the topic's
+    appearance in the transcript rather than clustering around first/middle/last.
 
     LIMITATION: This is a sampling strategy, not full coverage. Claude only sees
     a subset of each topic's segments, meaning:
     - Details in unsampled segments will not appear in the summary.
-    - Faithfulness evaluation is bounded by the same sample (Change 2/6 ensures
-      the evaluator checks against these exact segments, not different ones).
+    - Faithfulness evaluation is bounded by the same sample.
     - Increasing max_samples improves coverage but increases prompt size and cost.
     This trade-off is inherent to prompt-size-constrained LLM summarization.
     """
@@ -36,11 +36,40 @@ def _sample_topic_segments(
     if len(indices) <= max_samples:
         return indices
 
-    first = indices[0]
-    last = indices[-1]
-    middle = indices[len(indices) // 2]
-    # Use a set to deduplicate in case first/middle/last overlap (small topics).
-    return list(dict.fromkeys([first, middle, last]))
+    # Pick evenly spaced indices across the full range.
+    step = len(indices) / max_samples
+    sampled = []
+    for i in range(max_samples):
+        pos = int(i * step)
+        sampled.append(indices[pos])
+    # Always include the last segment to capture how the topic concludes.
+    if indices[-1] not in sampled:
+        sampled[-1] = indices[-1]
+    return sampled
+
+
+def _build_topic_excerpt(
+    topic: Topic,
+    segments: list[TranscriptSegment],
+    sampled_indices: list[int],
+    max_words_per_segment: int = 120,
+) -> str:
+    """
+    Build a condensed excerpt string from the sampled segments.
+
+    Instead of sending full ~250-word segments (which limits how many we can
+    include), we truncate each to max_words_per_segment. This lets us send
+    more segments within the same prompt budget, improving coverage and
+    reducing hallucination from incomplete context.
+    """
+    parts = []
+    for idx in sampled_indices:
+        words = segments[idx].text.split()
+        truncated = " ".join(words[:max_words_per_segment])
+        if len(words) > max_words_per_segment:
+            truncated += " [...]"
+        parts.append(f"[Segment {idx}]: {truncated}")
+    return "\n---\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +84,7 @@ def generate_generic_summary(
     Generate a balanced summary that covers each topic proportionally.
 
     Approach:
-    - For each topic, sample up to 3 representative segments (first, middle, last).
+    - For each topic, sample up to 5 representative segments spread across the topic.
     - Build a prompt that shows Claude each topic's name, proportion, and sample text.
     - Claude is instructed to mirror those proportions in the summary it writes.
     - Parse the response into SummarySegment objects — one per topic — so every
@@ -66,17 +95,17 @@ def generate_generic_summary(
     topic_blocks = []
     sampled_indices: dict[str, list[int]] = {}   # track which segments were actually sent to Claude
     for topic in topics:
-        sample_indices = _sample_topic_segments(topic, segments)
+        # Give every topic enough samples for Claude to write faithfully.
+        word_budget = int(MAX_SUMMARY_WORDS * topic.proportion)
+        word_budget = max(word_budget, 20)
+        sample_indices = _sample_topic_segments(topic, segments, max_samples=8)
         sampled_indices[topic.name] = sample_indices
-        sample_texts = [segments[i].text for i in sample_indices]
-
-        # Join samples with a separator so Claude can tell them apart.
-        combined = "\n---\n".join(sample_texts)
+        combined = _build_topic_excerpt(topic, segments, sample_indices)
 
         topic_blocks.append(
-            f"TOPIC: {topic.name} ({topic.proportion:.1%} of episode)\n"
+            f"TOPIC: {topic.name} ({topic.proportion:.1%} of episode) — write ~{word_budget} words\n"
             f"Description: {topic.description}\n"
-            f"Sample transcript text:\n{combined}"
+            f"Source transcript excerpts:\n{combined}"
         )
 
     topic_content = "\n\n".join(topic_blocks)
@@ -85,14 +114,23 @@ def generate_generic_summary(
     system_prompt = (
         f"You are a podcast summarizer. Create a balanced summary of this podcast episode. "
         f"Cover each topic proportionally based on how much of the episode it represents. "
-        f"Do not favor any topic over another. Write in clear, flowing paragraphs. "
-        f"Target length: {MAX_SUMMARY_WORDS} words."
+        f"Do not favor any topic over another. "
+        f"STRICT RULES: "
+        f"1. Do NOT use section headings, bullet points, or markdown formatting — write only flowing prose paragraphs. "
+        f"2. ONLY paraphrase or restate what is explicitly said in the excerpts. If a detail, quote, statistic, or claim is not in the provided text, do NOT include it. Do not infer, elaborate, or add context beyond the excerpts. "
+        f"3. If information is incomplete or a quote is cut off in the source, do NOT complete it — summarize only what is present. "
+        f"4. You MUST include at least one sentence for EVERY topic listed. No topic may be skipped. "
+        f"5. WORD COUNT: Your summary MUST be between {MIN_SUMMARY_WORDS} and {MAX_SUMMARY_WORDS_CEIL} words. "
+        f"Aim for ~{MAX_SUMMARY_WORDS} words. Do NOT write fewer than {MIN_SUMMARY_WORDS} or more than {MAX_SUMMARY_WORDS_CEIL}."
     )
 
     # --- User message: the actual transcript content ---
     user_message = (
         f"Here are the topics in this podcast episode with representative excerpts.\n"
-        f"Summarize each topic in proportion to its share of the episode.\n\n"
+        f"Summarize each topic in proportion to its share of the episode, following the word budgets shown.\n"
+        f"CRITICAL: Only include information that appears in the excerpts below. Do not add any details from outside knowledge. "
+        f"If a quote or detail is incomplete in the source, do not complete or embellish it.\n"
+        f"REMINDER: Your response must be {MIN_SUMMARY_WORDS}-{MAX_SUMMARY_WORDS_CEIL} words.\n\n"
         f"{topic_content}"
     )
 
@@ -100,7 +138,7 @@ def generate_generic_summary(
     try:
         response = client.messages.create(
             model=LLM_MODEL,
-            max_tokens=2048,
+            max_tokens=1500,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -163,7 +201,7 @@ def generate_unconstrained_summary(
 
     # How many sample segments to pull per preference level.
     # High = more context so Claude can write richer coverage.
-    samples_by_weight = {1.5: 5, 1.0: 3, 0.5: 1}
+    samples_by_weight = {1.5: 10, 1.0: 7, 0.5: 5}
 
     # --- Build the topic + sample text block for the prompt ---
     topic_blocks = []
@@ -171,17 +209,24 @@ def generate_unconstrained_summary(
     for topic in topics:
         weight = pref_lookup.get(topic.name, 1.0)   # default to medium if missing
         label = weight_to_label.get(weight, "MEDIUM")
-        max_samples = samples_by_weight.get(weight, 3)
+        max_samples = samples_by_weight.get(weight, 5)
+
+        # Compute word budget: HIGH topics get ~3x LOW topics.
+        if weight >= 1.5:
+            word_budget = int(MAX_SUMMARY_WORDS * 0.25)
+        elif weight <= 0.5:
+            word_budget = max(int(MAX_SUMMARY_WORDS * 0.05), 20)
+        else:
+            word_budget = int(MAX_SUMMARY_WORDS * 0.12)
 
         sample_indices = _sample_topic_segments(topic, segments, max_samples=max_samples)
         sampled_indices[topic.name] = sample_indices
-        sample_texts = [segments[i].text for i in sample_indices]
-        combined = "\n---\n".join(sample_texts)
+        combined = _build_topic_excerpt(topic, segments, sample_indices)
 
         topic_blocks.append(
-            f"TOPIC: {topic.name} | User preference: {label}\n"
+            f"TOPIC: {topic.name} | User preference: {label} — write ~{word_budget} words\n"
             f"Description: {topic.description}\n"
-            f"Sample transcript text:\n{combined}"
+            f"Source transcript excerpts:\n{combined}"
         )
 
     topic_content = "\n\n".join(topic_blocks)
@@ -193,13 +238,22 @@ def generate_unconstrained_summary(
         f"Topics rated MEDIUM should receive moderate coverage. "
         f"Topics rated LOW should receive minimal mention — just a brief sentence or two. "
         f"The user's preferences take full priority over the topic's original proportion in the episode. "
-        f"Write in clear, flowing paragraphs. Target length: {MAX_SUMMARY_WORDS} words."
+        f"STRICT RULES: "
+        f"1. Do NOT use section headings, bullet points, or markdown formatting — write only flowing prose paragraphs. "
+        f"2. ONLY paraphrase or restate what is explicitly said in the excerpts. If a detail, quote, statistic, or claim is not in the provided text, do NOT include it. Do not infer, elaborate, or add context beyond the excerpts. "
+        f"3. If information is incomplete or a quote is cut off in the source, do NOT complete it — summarize only what is present. "
+        f"4. You MUST include at least one sentence for EVERY topic listed. No topic may be skipped. "
+        f"5. WORD COUNT: Your summary MUST be between {MIN_SUMMARY_WORDS} and {MAX_SUMMARY_WORDS_CEIL} words. "
+        f"Aim for ~{MAX_SUMMARY_WORDS} words. Do NOT write fewer than {MIN_SUMMARY_WORDS} or more than {MAX_SUMMARY_WORDS_CEIL}."
     )
 
     # --- User message: topic data with explicit preference labels ---
     user_message = (
         f"Here are the podcast topics with the user's preference ratings.\n"
-        f"Adjust coverage depth according to each rating — HIGH gets the most, LOW gets the least.\n\n"
+        f"Adjust coverage depth according to each rating — HIGH gets the most, LOW gets the least.\n"
+        f"CRITICAL: Only include information that appears in the excerpts below. Do not add any details from outside knowledge. "
+        f"If a quote or detail is incomplete in the source, do not complete or embellish it.\n"
+        f"REMINDER: Your response must be {MIN_SUMMARY_WORDS}-{MAX_SUMMARY_WORDS_CEIL} words.\n\n"
         f"{topic_content}"
     )
 
@@ -207,7 +261,7 @@ def generate_unconstrained_summary(
     try:
         response = client.messages.create(
             model=LLM_MODEL,
-            max_tokens=2048,
+            max_tokens=1500,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -257,41 +311,76 @@ def calculate_constrained_proportions(
     The core idea of Constrained Relevance Weighting:
     - Start with each topic's base proportion (how much of the episode it occupied).
     - Multiply by the user's weight to get a raw target (e.g. high = *1.5).
-    - But clamp that target to [base - delta, base + delta] so no topic can be
-      expanded or compressed by more than `delta` percentage points.
+    - But clamp that target so the FINAL proportion stays within [base - delta, base + delta].
     - Also enforce a floor of 0.01 so every topic gets at least a 1% mention.
-    - Finally, normalize all clamped values so they sum to exactly 1.0.
+    - Use iterative projection to normalize to 1.0 without violating the delta bound.
 
-    Example with delta=0.15:
-      Topic A: base=0.40, weight=1.5 → raw=0.60, clamped to 0.40+0.15=0.55
-      Topic B: base=0.10, weight=0.5 → raw=0.05, clamped to 0.10-0.15=-0.05 → floor → 0.01
-      → then normalize so all sum to 1.0
+    The naive approach (clamp then normalize once) breaks the delta guarantee because
+    normalization can push values outside their bounds. Instead we iteratively:
+      1. Clamp all values to their bounds.
+      2. Identify topics that are "pinned" (sitting at a bound).
+      3. Distribute the surplus/deficit across unpinned topics.
+      4. Repeat until convergence.
 
     Returns a dict mapping topic_name → constrained proportion (floats summing to 1.0).
     """
+    FLOOR = 0.01
     pref_lookup = {p.topic_name: p.weight for p in preferences}
 
-    clamped: dict[str, float] = {}
+    # Compute bounds and initial targets for each topic.
+    names = [t.name for t in topics]
+    lower_bounds: dict[str, float] = {}
+    upper_bounds: dict[str, float] = {}
+    values: dict[str, float] = {}
+
     for topic in topics:
         base = topic.proportion
         weight = pref_lookup.get(topic.name, 1.0)
 
-        # Step 1: apply the user's weight to get an unconstrained target.
+        # Raw unconstrained target.
         raw_target = base * weight
 
-        # Step 2: clamp to within delta of the base proportion.
-        lower = base - delta
-        upper = base + delta
-        clamped_value = max(lower, min(raw_target, upper))
+        # Bounds: must stay within delta of base, and above the floor.
+        lb = max(base - delta, FLOOR)
+        ub = max(base + delta, FLOOR)
+        lower_bounds[topic.name] = lb
+        upper_bounds[topic.name] = ub
 
-        # Step 3: enforce a minimum of 0.01 — every topic gets at least a brief mention.
-        clamped_value = max(clamped_value, 0.01)
+        # Initial value: clamp raw target to bounds.
+        values[topic.name] = max(lb, min(raw_target, ub))
 
-        clamped[topic.name] = clamped_value
+    # Iterative projection: normalize while respecting bounds.
+    # Converges in a few iterations because each round pins at least one more topic.
+    for _ in range(20):
+        total = sum(values.values())
+        if abs(total - 1.0) < 1e-9:
+            break
 
-    # Step 4: normalize so all proportions sum to 1.0.
-    total = sum(clamped.values())
-    return {name: value / total for name, value in clamped.items()}
+        # Scale all values toward summing to 1.0.
+        factor = 1.0 / total
+        adjusted: dict[str, float] = {}
+        for name in names:
+            adjusted[name] = values[name] * factor
+
+        # Re-clamp anything that went out of bounds.
+        clamped_any = False
+        for name in names:
+            lb = lower_bounds[name]
+            ub = upper_bounds[name]
+            if adjusted[name] < lb:
+                adjusted[name] = lb
+                clamped_any = True
+            elif adjusted[name] > ub:
+                adjusted[name] = ub
+                clamped_any = True
+
+        values = adjusted
+        if not clamped_any:
+            break
+
+    # Final safety: normalize to exactly 1.0 (handles floating-point dust).
+    total = sum(values.values())
+    return {name: value / total for name, value in values.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +413,12 @@ def generate_constrained_summary(
     # --- Determine sample count per topic based on constrained proportion ---
     # Topics with higher target proportions get more sample text in the prompt,
     # giving Claude richer material to draw from for more detailed coverage.
-    # Scale: proportion >= 0.20 → 5 samples, >= 0.10 → 3, below → 1.
     def samples_for_proportion(p: float) -> int:
         if p >= 0.20:
-            return 5
+            return 10
         if p >= 0.10:
-            return 3
-        return 1
+            return 7
+        return 5
 
     # --- Build the topic + sample text block for the prompt ---
     topic_blocks = []
@@ -342,16 +430,18 @@ def generate_constrained_summary(
         label = weight_to_label.get(weight, "MEDIUM")
         max_samples = samples_for_proportion(constrained)
 
+        # Explicit word budget so Claude knows exactly how many words to allocate.
+        word_budget = max(int(MAX_SUMMARY_WORDS * constrained), 20)
+
         sample_indices = _sample_topic_segments(topic, segments, max_samples=max_samples)
         sampled_indices[topic.name] = sample_indices
-        sample_texts = [segments[i].text for i in sample_indices]
-        combined = "\n---\n".join(sample_texts)
+        combined = _build_topic_excerpt(topic, segments, sample_indices)
 
         topic_blocks.append(
-            f"TOPIC: {topic.name} | User preference: {label}\n"
+            f"TOPIC: {topic.name} | User preference: {label} — write ~{word_budget} words\n"
             f"  Original proportion: {original:.1%}  →  Target proportion: {constrained:.1%}\n"
             f"Description: {topic.description}\n"
-            f"Sample transcript text:\n{combined}"
+            f"Source transcript excerpts:\n{combined}"
         )
 
     topic_content = "\n\n".join(topic_blocks)
@@ -361,16 +451,21 @@ def generate_constrained_summary(
         f"You are a personalized podcast summarizer using Constrained Relevance Weighting. "
         f"Each topic has an ORIGINAL proportion (how much it appeared in the episode) and a "
         f"TARGET proportion (adjusted for user preference within bounded limits). "
-        f"Cover each topic according to its TARGET proportion, but ensure every topic receives "
-        f"at least a brief mention. Do not fabricate information beyond what the transcript contains. "
-        f"All claims must be traceable to the provided transcript excerpts. "
-        f"Write in clear, flowing paragraphs. Target length: {MAX_SUMMARY_WORDS} words."
+        f"Cover each topic according to its TARGET proportion, using the word budgets shown. "
+        f"STRICT RULES: "
+        f"1. Do NOT use section headings, bullet points, or markdown formatting — write only flowing prose paragraphs. "
+        f"2. ONLY paraphrase or restate what is explicitly said in the excerpts. If a detail, quote, statistic, or claim is not in the provided text, do NOT include it. Do not infer, elaborate, or add context beyond the excerpts. "
+        f"3. If information is incomplete or a quote is cut off in the source, do NOT complete it — summarize only what is present. "
+        f"4. You MUST include at least one sentence for EVERY topic listed. No topic may be skipped. "
+        f"5. HARD LIMIT: {MAX_SUMMARY_WORDS} words maximum. Aim for the per-topic word budgets shown."
     )
 
     # --- User message ---
     user_message = (
         f"Here are the podcast topics with their original and target proportions.\n"
-        f"Allocate your summary words according to the TARGET proportion for each topic.\n\n"
+        f"Allocate your summary words according to the word budget shown for each topic.\n"
+        f"CRITICAL: Only include information that appears in the excerpts below. Do not add any details from outside knowledge. "
+        f"If a quote or detail is incomplete in the source, do not complete or embellish it.\n\n"
         f"{topic_content}"
     )
 
@@ -378,7 +473,7 @@ def generate_constrained_summary(
     try:
         response = client.messages.create(
             model=LLM_MODEL,
-            max_tokens=2048,
+            max_tokens=1200,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -445,9 +540,20 @@ def generate_baseline_summary(
         # Concatenate all of this topic's segment texts.
         full_text = " ".join(segments[i].text for i in topic.segment_indices)
 
-        # Take the first word_budget words.
+        # Take roughly word_budget words, snapping to the nearest sentence boundary.
         words = full_text.split()
-        extracted = " ".join(words[:word_budget])
+        if len(words) <= word_budget:
+            extracted = full_text
+        else:
+            rough_cut = " ".join(words[:word_budget])
+            # Find the last sentence-ending punctuation within the rough cut.
+            last_period = max(rough_cut.rfind('. '), rough_cut.rfind('? '), rough_cut.rfind('! '))
+            if last_period > len(rough_cut) // 3:
+                # Snap to sentence boundary if it's not too far back.
+                extracted = rough_cut[:last_period + 1]
+            else:
+                # No good sentence boundary — use the rough cut as-is.
+                extracted = rough_cut
 
         # Track which segments contributed (all segments whose text was included).
         used_indices = []
