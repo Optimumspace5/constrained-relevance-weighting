@@ -41,17 +41,21 @@ def evaluate_faithfulness(
     # Track per-topic scores for controlled comparison across summary types.
     topic_scores: dict[str, list[int]] = {}
 
-    # Use the exact segments the summarizer sent to Claude, stored in metadata.
-    # This ensures faithfulness is checked against the same evidence the summary was built from,
-    # rather than re-sampling independently (which could pick different segments).
-    sampled_indices = summary.metadata.get("sampled_indices", {})
+    # Use ALL sampled segments for the topic (what the generator actually saw) for verification.
+    # After evidence linking, each paragraph only has 1-3 source segments — too few for
+    # reliable claim verification. The generator had access to ALL sampled segments for the
+    # topic, so any faithful paraphrase should be verifiable against that full set.
+    sampled_indices_map = summary.metadata.get("sampled_indices", {})
 
     for seg in summary.segments:
-        # Look up the segments that were actually used to generate this topic's summary.
-        # Falls back to source_segment_indices if sampled_indices isn't available (backwards compat).
-        source_indices = sampled_indices.get(seg.topic_name, [])
-        if not source_indices:
-            source_indices = seg.source_segment_indices[:7] if seg.source_segment_indices else []
+        # Primary: all segments the generator saw for this topic.
+        # Fallback: evidence-linked indices, then raw source_segment_indices.
+        source_indices = list(sampled_indices_map.get(seg.topic_name, []))
+        # Also include evidence-linked indices for additional context.
+        for idx in seg.source_segment_indices:
+            if idx not in source_indices:
+                source_indices.append(idx)
+        source_indices = source_indices[:15]  # cap to avoid prompt overflow
 
         # Build the source excerpt block — first 200 words of each source segment.
         source_blocks = []
@@ -229,18 +233,56 @@ def compute_extractive_overlap(
 
 def evaluate_coverage(summary: Summary, topics: list[Topic]) -> dict:
     """
-    Check how many of the identified topics appear in the summary.
+    Check how many of the identified topics appear in the summary with meaningful content.
 
-    A topic is considered "covered" if at least one SummarySegment is attributed
-    to it. Missing topics indicate the summary dropped something from the episode.
+    A topic is considered "covered" if at least one SummarySegment attributed to it
+    contains a minimum amount of substantive text (at least 15 words). This prevents
+    counting topics that technically have a SummarySegment but no real content.
+
+    After evidence linking, each SummarySegment holds one paragraph — so this checks
+    whether each topic got at least one paragraph with real content. Before evidence
+    linking, all segments share the full summary text, so we fall back to keyword-based
+    detection using topic names and descriptions.
     """
     all_topic_names = {t.name for t in topics}
+    MIN_WORDS_FOR_COVERAGE = 15   # a topic needs at least this many words to count as covered
 
-    # Collect which topic names appear across all summary segments.
-    covered_topic_names = {seg.topic_name for seg in summary.segments}
+    # Check whether segments have been split into per-paragraph form (evidence linked)
+    # or are still the coarse form (all sharing the same full text).
+    texts_are_shared = (
+        len(summary.segments) > 1
+        and summary.segments[0].text == summary.segments[1].text
+    ) if len(summary.segments) > 1 else False
+
+    if texts_are_shared:
+        # Pre-evidence-linking: segments all share the same full summary text.
+        # Use keyword detection — check if the summary text mentions each topic.
+        full_text = summary.segments[0].text.lower()
+        topic_map = {t.name: t for t in topics}
+        covered_topic_names = set()
+        for topic in topics:
+            # Check for topic name or key description words in the summary.
+            name_words = topic.name.lower().split()
+            desc_words = topic.description.lower().split()[:5]  # first 5 words of description
+            # Topic is covered if its name (or most of its name words) appear in the text.
+            name_matches = sum(1 for w in name_words if w in full_text)
+            if name_matches >= max(1, len(name_words) // 2):
+                covered_topic_names.add(topic.name)
+    else:
+        # Post-evidence-linking: each segment is a separate paragraph with its own text.
+        # A topic is covered if it has at least one paragraph with >= MIN_WORDS_FOR_COVERAGE words.
+        topic_word_counts: dict[str, int] = {}
+        for seg in summary.segments:
+            word_count = len(seg.text.split())
+            topic_word_counts[seg.topic_name] = topic_word_counts.get(seg.topic_name, 0) + word_count
+
+        covered_topic_names = {
+            name for name, wc in topic_word_counts.items()
+            if wc >= MIN_WORDS_FOR_COVERAGE and name in all_topic_names
+        }
 
     missing = sorted(all_topic_names - covered_topic_names)
-    topics_covered = len(covered_topic_names & all_topic_names)   # intersection in case of stray names
+    topics_covered = len(covered_topic_names & all_topic_names)
     total = len(all_topic_names)
 
     return {
@@ -361,17 +403,25 @@ def evaluate_faithfulness_qa(
         - unsupported: list of claims that could not be verified
         - per_topic: dict of topic_name → {total, supported, precision}
     """
-    # Get the sampled indices so we check against the same evidence the summary used.
-    sampled_indices = summary.metadata.get("sampled_indices", {})
+    # Use ALL sampled segments for the topic (what the generator actually saw) for verification.
+    # After evidence linking, each paragraph only has 1-3 linked source segments — too few
+    # for reliable claim verification. The generator had access to ALL sampled segments for
+    # the topic, so any faithful paraphrase should be verifiable against that full set.
+    # This is critical for constrained summaries which cover more topics with more claims.
+    sampled_indices_map = summary.metadata.get("sampled_indices", {})
 
     all_claims = []          # list of (claim_text, topic_name, is_supported)
     per_topic: dict[str, dict] = {}
 
     for seg in summary.segments:
         # --- Step 1: Extract atomic claims from this paragraph ---
-        source_indices = sampled_indices.get(seg.topic_name, [])
-        if not source_indices:
-            source_indices = seg.source_segment_indices[:10] if seg.source_segment_indices else []
+        # Primary: all segments the generator saw for this topic.
+        source_indices = list(sampled_indices_map.get(seg.topic_name, []))
+        # Also include evidence-linked indices for additional context.
+        for idx in seg.source_segment_indices:
+            if idx not in source_indices:
+                source_indices.append(idx)
+        source_indices = source_indices[:15]  # cap to avoid prompt overflow
 
         extract_prompt = (
             "Extract every distinct factual claim from this summary paragraph. "

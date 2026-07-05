@@ -1,0 +1,136 @@
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0L12 6L0 12V0Z" fill="#1F2937"/>
+    </marker>
+    <style>
+      .title { font: 700 54px 'Segoe UI', Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 500 24px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .stepTitle { font: 700 28px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .body { font: 500 22px 'Segoe UI', Arial, sans-serif; fill: #334155; }
+      .small { font: 600 20px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .tiny { font: 600 18px 'Segoe UI', Arial, sans-serif; fill: #64748B; }
+      .accent { font: 700 24px 'Segoe UI', Arial, sans-serif; fill: #1D4ED8; }
+      .red { font: 700 24px 'Segoe UI', Arial, sans-serif; fill: #B91C1C; }
+      .green { font: 700 24px 'Segoe UI', Arial, sans-serif; fill: #047857; }
+      .box1 { fill: #F8FAFC; stroke: #94A3B8; stroke-width: 2.5; rx: 24; }
+      .box2 { fill: #EFF6FF; stroke: #60A5FA; stroke-width: 2.5; rx: 24; }
+      .box3 { fill: #FEF2F2; stroke: #F87171; stroke-width: 2.5; rx: 24; }
+      .box4 { fill: #ECFDF5; stroke: #34D399; stroke-width: 2.5; rx: 24; }
+      .box5 { fill: #FFF7ED; stroke: #FDBA74; stroke-width: 2.5; rx: 24; }
+      .arrowLine { stroke: #1F2937; stroke-width: 4; stroke-linecap: round; marker-end: url(#arrow); }
+      .pillBlue { fill: #DBEAFE; stroke: #60A5FA; stroke-width: 2; rx: 12; }
+      .pillRed { fill: #FEE2E2; stroke: #FCA5A5; stroke-width: 2; rx: 12; }
+      .pillGreen { fill: #D1FAE5; stroke: #6EE7B7; stroke-width: 2; rx: 12; }
+      .pillGray { fill: #F1F5F9; stroke: #CBD5E1; stroke-width: 2; rx: 12; }
+    </style>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#FCFCFD"/>
+
+  <text x="960" y="88" text-anchor="middle" class="title">How Constrained Relevance Weighting Works</text>
+  <text x="960" y="128" text-anchor="middle" class="subtitle">Original transcript proportions are adjusted by user preference, then bounded before final summary generation.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="72" y="220" width="320" height="560" class="box1"/>
+    <rect x="432" y="220" width="320" height="560" class="box2"/>
+    <rect x="792" y="220" width="320" height="560" class="box3"/>
+    <rect x="1152" y="220" width="320" height="560" class="box4"/>
+    <rect x="1512" y="220" width="336" height="560" class="box5"/>
+  </g>
+
+  <text x="232" y="276" text-anchor="middle" class="stepTitle">1. Base Proportion</text>
+  <text x="592" y="276" text-anchor="middle" class="stepTitle">2. Apply User Weight</text>
+  <text x="952" y="276" text-anchor="middle" class="stepTitle">3. Clamp with Delta</text>
+  <text x="1312" y="276" text-anchor="middle" class="stepTitle">4. Apply Floor</text>
+  <text x="1680" y="276" text-anchor="middle" class="stepTitle">5. Normalize</text>
+
+  <text x="232" y="332" text-anchor="middle" class="body">Measure how much of the</text>
+  <text x="232" y="362" text-anchor="middle" class="body">transcript belongs to</text>
+  <text x="232" y="392" text-anchor="middle" class="body">each topic.</text>
+
+  <rect x="128" y="438" width="208" height="74" class="pillGray"/>
+  <text x="232" y="468" text-anchor="middle" class="small">Example topic</text>
+  <text x="232" y="497" text-anchor="middle" class="accent">Base = 15%</text>
+
+  <rect x="120" y="560" width="224" height="112" class="pillGray"/>
+  <text x="232" y="603" text-anchor="middle" class="body">This is the source</text>
+  <text x="232" y="635" text-anchor="middle" class="body">topic share before</text>
+  <text x="232" y="667" text-anchor="middle" class="body">personalization.</text>
+
+  <text x="592" y="332" text-anchor="middle" class="body">Convert preferences into</text>
+  <text x="592" y="362" text-anchor="middle" class="body">numerical weights and</text>
+  <text x="592" y="392" text-anchor="middle" class="body">compute a raw target.</text>
+
+  <rect x="474" y="438" width="236" height="74" class="pillBlue"/>
+  <text x="592" y="469" text-anchor="middle" class="small">High = 1.5</text>
+  <text x="592" y="497" text-anchor="middle" class="accent">15% × 1.5 = 22.5%</text>
+
+  <rect x="472" y="560" width="240" height="144" class="pillBlue"/>
+  <text x="592" y="602" text-anchor="middle" class="body">This is the raw personalized</text>
+  <text x="592" y="634" text-anchor="middle" class="body">target before any safety</text>
+  <text x="592" y="666" text-anchor="middle" class="body">constraints are applied.</text>
+  <text x="592" y="698" text-anchor="middle" class="tiny">High pushes up, low pushes down.</text>
+
+  <text x="952" y="332" text-anchor="middle" class="body">Keep the topic inside an</text>
+  <text x="952" y="362" text-anchor="middle" class="body">allowed band around</text>
+  <text x="952" y="392" text-anchor="middle" class="body">the original source share.</text>
+
+  <rect x="836" y="438" width="232" height="74" class="pillRed"/>
+  <text x="952" y="469" text-anchor="middle" class="small">Delta = 10%</text>
+  <text x="952" y="497" text-anchor="middle" class="red">Allowed range: 5% to 25%</text>
+
+  <line x1="838" y1="612" x2="1066" y2="612" stroke="#334155" stroke-width="4" stroke-linecap="round"/>
+  <line x1="882" y1="590" x2="882" y2="634" stroke="#64748B" stroke-width="4"/>
+  <line x1="952" y1="578" x2="952" y2="646" stroke="#B91C1C" stroke-width="4.5"/>
+  <line x1="1022" y1="590" x2="1022" y2="634" stroke="#64748B" stroke-width="4"/>
+  <text x="882" y="668" text-anchor="middle" class="small">5%</text>
+  <text x="952" y="564" text-anchor="middle" class="red">Base = 15%</text>
+  <text x="1022" y="668" text-anchor="middle" class="small">25%</text>
+
+  <rect x="832" y="704" width="240" height="56" class="pillRed"/>
+  <text x="952" y="739" text-anchor="middle" class="body">22.5% stays unchanged</text>
+
+  <text x="1312" y="332" text-anchor="middle" class="body">Prevent tiny or low-priority</text>
+  <text x="1312" y="362" text-anchor="middle" class="body">topics from disappearing</text>
+  <text x="1312" y="392" text-anchor="middle" class="body">completely.</text>
+
+  <rect x="1214" y="438" width="196" height="74" class="pillGreen"/>
+  <text x="1312" y="469" text-anchor="middle" class="small">Floor = 1%</text>
+  <text x="1312" y="497" text-anchor="middle" class="green">Minimum presence kept</text>
+
+  <rect x="1198" y="564" width="228" height="128" class="pillGreen"/>
+  <text x="1312" y="608" text-anchor="middle" class="body">If a topic becomes too small,</text>
+  <text x="1312" y="640" text-anchor="middle" class="body">the floor keeps at least a</text>
+  <text x="1312" y="672" text-anchor="middle" class="body">minimal mention in the summary.</text>
+
+  <text x="1680" y="332" text-anchor="middle" class="body">Adjust all topic shares so</text>
+  <text x="1680" y="362" text-anchor="middle" class="body">the final allocation sums</text>
+  <text x="1680" y="392" text-anchor="middle" class="body">cleanly to 100%.</text>
+
+  <rect x="1570" y="438" width="220" height="74" class="pillGray"/>
+  <text x="1680" y="469" text-anchor="middle" class="small">Final target</text>
+  <text x="1680" y="497" text-anchor="middle" class="accent">Used for summary length</text>
+
+  <rect x="1562" y="566" width="236" height="142" class="pillGray"/>
+  <text x="1680" y="610" text-anchor="middle" class="body">These normalized topic shares</text>
+  <text x="1680" y="642" text-anchor="middle" class="body">tell the system how much space</text>
+  <text x="1680" y="674" text-anchor="middle" class="body">each topic should get.</text>
+  <text x="1680" y="706" text-anchor="middle" class="tiny">This is what drives the constrained summary.</text>
+
+  <line x1="392" y1="500" x2="432" y2="500" class="arrowLine"/>
+  <line x1="752" y1="500" x2="792" y2="500" class="arrowLine"/>
+  <line x1="1112" y1="500" x2="1152" y2="500" class="arrowLine"/>
+  <line x1="1472" y1="500" x2="1512" y2="500" class="arrowLine"/>
+
+  <rect x="180" y="878" width="1560" height="122" rx="28" fill="#0F172A"/>
+  <text x="960" y="930" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="700" fill="#F8FAFC">
+    Original share → user influence → bounded adjustment → final allocation
+  </text>
+  <text x="960" y="968" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="500" fill="#CBD5E1">
+    CRW does not let user preference completely override the transcript. It rebalances the summary within explicit limits.
+  </text>
+</svg>

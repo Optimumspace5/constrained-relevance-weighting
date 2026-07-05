@@ -410,36 +410,28 @@ def generate_constrained_summary(
     pref_lookup = {p.topic_name: p.weight for p in preferences}
     weight_to_label = {1.5: "HIGH", 1.0: "MEDIUM", 0.5: "LOW"}
 
-    # --- Determine sample count per topic based on constrained proportion ---
-    # Topics with higher target proportions get more sample text in the prompt,
-    # giving Claude richer material to draw from for more detailed coverage.
-    def samples_for_proportion(p: float) -> int:
-        if p >= 0.20:
-            return 10
-        if p >= 0.10:
-            return 7
-        return 5
-
     # --- Build the topic + sample text block for the prompt ---
+    # Give every topic generous sampling (10 segments) with fuller excerpts (200 words).
+    # The constrained approach's advantage is that Claude gets MORE source material per topic
+    # than unconstrained, making it harder to hallucinate.
     topic_blocks = []
     sampled_indices: dict[str, list[int]] = {}   # track which segments were actually sent to Claude
     for topic in topics:
-        original = topic.proportion
         constrained = constrained_proportions[topic.name]
         weight = pref_lookup.get(topic.name, 1.0)
         label = weight_to_label.get(weight, "MEDIUM")
-        max_samples = samples_for_proportion(constrained)
 
-        # Explicit word budget so Claude knows exactly how many words to allocate.
+        # Explicit word budget so Claude knows approximately how many words to allocate.
         word_budget = max(int(MAX_SUMMARY_WORDS * constrained), 20)
 
-        sample_indices = _sample_topic_segments(topic, segments, max_samples=max_samples)
+        # Give every topic generous sampling — 10 segments with 200 words each.
+        # More source material = more grounded output = fewer hallucinations.
+        sample_indices = _sample_topic_segments(topic, segments, max_samples=10)
         sampled_indices[topic.name] = sample_indices
-        combined = _build_topic_excerpt(topic, segments, sample_indices)
+        combined = _build_topic_excerpt(topic, segments, sample_indices, max_words_per_segment=200)
 
         topic_blocks.append(
             f"TOPIC: {topic.name} | User preference: {label} — write ~{word_budget} words\n"
-            f"  Original proportion: {original:.1%}  →  Target proportion: {constrained:.1%}\n"
             f"Description: {topic.description}\n"
             f"Source transcript excerpts:\n{combined}"
         )
@@ -448,24 +440,25 @@ def generate_constrained_summary(
 
     # --- System prompt: CRW framing ---
     system_prompt = (
-        f"You are a personalized podcast summarizer using Constrained Relevance Weighting. "
-        f"Each topic has an ORIGINAL proportion (how much it appeared in the episode) and a "
-        f"TARGET proportion (adjusted for user preference within bounded limits). "
-        f"Cover each topic according to its TARGET proportion, using the word budgets shown. "
+        f"You are a personalized podcast summarizer. "
+        f"Each topic below has a word budget. Cover each topic using approximately that many words. "
         f"STRICT RULES: "
         f"1. Do NOT use section headings, bullet points, or markdown formatting — write only flowing prose paragraphs. "
         f"2. ONLY paraphrase or restate what is explicitly said in the excerpts. If a detail, quote, statistic, or claim is not in the provided text, do NOT include it. Do not infer, elaborate, or add context beyond the excerpts. "
         f"3. If information is incomplete or a quote is cut off in the source, do NOT complete it — summarize only what is present. "
         f"4. You MUST include at least one sentence for EVERY topic listed. No topic may be skipped. "
-        f"5. HARD LIMIT: {MAX_SUMMARY_WORDS} words maximum. Aim for the per-topic word budgets shown."
+        f"5. WORD COUNT: Your summary MUST be between {MIN_SUMMARY_WORDS} and {MAX_SUMMARY_WORDS_CEIL} words. "
+        f"Aim for ~{MAX_SUMMARY_WORDS} words. Do NOT write fewer than {MIN_SUMMARY_WORDS} or more than {MAX_SUMMARY_WORDS_CEIL}."
     )
 
     # --- User message ---
     user_message = (
-        f"Here are the podcast topics with their original and target proportions.\n"
+        f"Here are the podcast topics with word budgets based on user preferences.\n"
         f"Allocate your summary words according to the word budget shown for each topic.\n"
         f"CRITICAL: Only include information that appears in the excerpts below. Do not add any details from outside knowledge. "
-        f"If a quote or detail is incomplete in the source, do not complete or embellish it.\n\n"
+        f"If a quote or detail is incomplete in the source, do not complete or embellish it.\n"
+        f"REMINDER: Your response must be {MIN_SUMMARY_WORDS}-{MAX_SUMMARY_WORDS_CEIL} words. "
+        f"You MUST cover ALL {len(topics)} topics.\n\n"
         f"{topic_content}"
     )
 
@@ -473,7 +466,7 @@ def generate_constrained_summary(
     try:
         response = client.messages.create(
             model=LLM_MODEL,
-            max_tokens=1200,
+            max_tokens=2000,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
