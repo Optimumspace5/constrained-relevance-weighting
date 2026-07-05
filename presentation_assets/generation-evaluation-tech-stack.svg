@@ -1,0 +1,127 @@
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0L12 6L0 12V0Z" fill="#1F2937"/>
+    </marker>
+    <style>
+      .title { font: 700 50px 'Segoe UI', Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 500 24px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .panelTitle { font: 700 30px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .section { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .body { font: 500 21px 'Segoe UI', Arial, sans-serif; fill: #334155; }
+      .small { font: 600 18px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .tiny { font: 500 16px 'Segoe UI', Arial, sans-serif; fill: #64748B; }
+      .micro { font: 500 14px 'Segoe UI', Arial, sans-serif; fill: #64748B; }
+      .box { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 2.5; rx: 26; }
+      .accent { fill: #FFF1F2; stroke: #FB7185; stroke-width: 2.5; rx: 18; }
+      .warm { fill: #FFF7ED; stroke: #FDBA74; stroke-width: 2.5; rx: 18; }
+      .cool { fill: #EFF6FF; stroke: #93C5FD; stroke-width: 2.5; rx: 18; }
+      .green { fill: #ECFDF5; stroke: #6EE7B7; stroke-width: 2.5; rx: 18; }
+      .darkband { fill: #0F172A; rx: 26; }
+      .arrowLine { stroke: #1F2937; stroke-width: 4; stroke-linecap: round; marker-end: url(#arrow); fill: none; }
+    </style>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#FCFCFD"/>
+
+  <text x="960" y="88" text-anchor="middle" class="title">Summary Generation, Evidence Linking, and Evaluation</text>
+  <text x="960" y="128" text-anchor="middle" class="subtitle">After CRW computes the topic allocations, we generate three summary modes, trace them back to evidence, and compare them with complementary metrics.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="190" width="520" height="690" class="box"/>
+    <rect x="640" y="190" width="520" height="690" class="box"/>
+    <rect x="1210" y="190" width="640" height="690" class="box"/>
+  </g>
+
+  <text x="330" y="246" text-anchor="middle" class="panelTitle">1. Three Summary Modes</text>
+  <text x="900" y="246" text-anchor="middle" class="panelTitle">2. Evidence Linking</text>
+  <text x="1530" y="246" text-anchor="middle" class="panelTitle">3. Evaluation Framework</text>
+
+  <g filter="url(#shadow)">
+    <rect x="110" y="300" width="440" height="120" class="warm"/>
+    <text x="330" y="344" text-anchor="middle" class="section">Generic Summary</text>
+    <text x="330" y="378" text-anchor="middle" class="body">Follows the original source topic distribution</text>
+
+    <rect x="110" y="452" width="440" height="140" class="cool"/>
+    <text x="330" y="496" text-anchor="middle" class="section">Unconstrained Personalized Summary</text>
+    <text x="330" y="530" text-anchor="middle" class="body">Allows user preferences to fully reshape</text>
+    <text x="330" y="560" text-anchor="middle" class="body">how much attention each topic receives</text>
+
+    <rect x="110" y="624" width="440" height="160" class="accent"/>
+    <text x="330" y="668" text-anchor="middle" class="section">Constrained Personalized Summary</text>
+    <text x="330" y="702" text-anchor="middle" class="body">Applies CRW so topic shifts remain</text>
+    <text x="330" y="732" text-anchor="middle" class="body">bounded by ± delta and anchored</text>
+    <text x="330" y="762" text-anchor="middle" class="body">to the transcript structure</text>
+  </g>
+
+  <path d="M550 360C608 360 606 360 640 360" class="arrowLine"/>
+  <path d="M550 522C608 522 606 522 640 522" class="arrowLine"/>
+  <path d="M550 704C608 704 606 704 640 704" class="arrowLine"/>
+
+  <rect x="700" y="308" width="400" height="122" class="green"/>
+  <text x="900" y="350" text-anchor="middle" class="section">Paragraph-Level Linking</text>
+  <text x="900" y="384" text-anchor="middle" class="body">Each generated summary paragraph is linked</text>
+  <text x="900" y="414" text-anchor="middle" class="body">back to relevant transcript segments</text>
+
+  <rect x="700" y="474" width="400" height="144" class="cool"/>
+  <text x="900" y="516" text-anchor="middle" class="section">Why it matters</text>
+  <text x="900" y="550" text-anchor="middle" class="body">Improves traceability and interpretability</text>
+  <text x="900" y="582" text-anchor="middle" class="body">Makes summaries easier to inspect</text>
+  <text x="900" y="614" text-anchor="middle" class="body">Supports auditing of factual claims</text>
+
+  <rect x="700" y="662" width="400" height="158" class="warm"/>
+  <text x="900" y="704" text-anchor="middle" class="section">Key idea</text>
+  <text x="900" y="738" text-anchor="middle" class="body">The output is not just generated text.</text>
+  <text x="900" y="770" text-anchor="middle" class="body">It also preserves a path back</text>
+  <text x="900" y="802" text-anchor="middle" class="body">to the original transcript evidence.</text>
+
+  <path d="M1100 360C1160 360 1165 326 1210 326" class="arrowLine"/>
+  <path d="M1100 546C1160 546 1165 486 1210 486" class="arrowLine"/>
+  <path d="M1100 742C1160 742 1165 646 1210 646" class="arrowLine"/>
+
+  <rect x="1260" y="274" width="540" height="136" class="warm"/>
+  <text x="1530" y="330" text-anchor="middle" class="section">Faithfulness</text>
+  <text x="1530" y="364" text-anchor="middle" class="body">Checks how well the summary stays</text>
+  <text x="1530" y="394" text-anchor="middle" class="body">grounded in transcript evidence</text>
+
+  <rect x="1260" y="430" width="540" height="188" class="cool"/>
+  <text x="1530" y="478" text-anchor="middle" class="section">Claim Support (QAGS-inspired)</text>
+  <text x="1530" y="512" text-anchor="middle" class="body">Extract factual claims from the summary</text>
+  <text x="1530" y="542" text-anchor="middle" class="body">and check whether each claim is supported</text>
+  <text x="1530" y="572" text-anchor="middle" class="body">by transcript evidence</text>
+  <text x="1530" y="604" text-anchor="middle" class="small">Score = supported claims / total claims</text>
+
+  <text x="1530" y="632" text-anchor="middle" class="micro">Inspired by QAGS, but not a paper-faithful QA-answer comparison pipeline</text>
+
+  <rect x="1260" y="642" width="540" height="102" class="green"/>
+  <text x="1530" y="684" text-anchor="middle" class="section">ROUGE</text>
+  <text x="1530" y="718" text-anchor="middle" class="body">Measures lexical overlap between the summary</text>
+  <text x="1530" y="748" text-anchor="middle" class="body">and source or reference text</text>
+
+  <rect x="1260" y="762" width="540" height="110" class="accent"/>
+  <text x="1530" y="804" text-anchor="middle" class="section">Coverage, Relevance, and MAE</text>
+  <text x="1530" y="838" text-anchor="middle" class="body">Checks topic presence, user alignment, and</text>
+  <text x="1530" y="868" text-anchor="middle" class="body">deviation from intended or original topic mix</text>
+
+  <rect x="140" y="920" width="1640" height="120" class="darkband"/>
+  <text x="260" y="968" class="section" fill="#F8FAFC">Technical stack</text>
+
+  <rect x="430" y="938" width="290" height="70" rx="18" fill="#111827" stroke="#334155" stroke-width="2"/>
+  <text x="575" y="968" text-anchor="middle" class="small" fill="#E2E8F0">Python pipeline</text>
+  <text x="575" y="993" text-anchor="middle" class="tiny" fill="#CBD5E1">preprocessing, CRW logic, evaluation</text>
+
+  <rect x="815" y="938" width="290" height="70" rx="18" fill="#111827" stroke="#334155" stroke-width="2"/>
+  <text x="960" y="968" text-anchor="middle" class="small" fill="#E2E8F0">Claude API</text>
+  <text x="960" y="993" text-anchor="middle" class="tiny" fill="#CBD5E1">topic discovery, generation, judging</text>
+
+  <rect x="1200" y="938" width="290" height="70" rx="18" fill="#111827" stroke="#334155" stroke-width="2"/>
+  <text x="1345" y="968" text-anchor="middle" class="small" fill="#E2E8F0">Streamlit interface</text>
+  <text x="1345" y="993" text-anchor="middle" class="tiny" fill="#CBD5E1">upload, preferences, result comparison</text>
+
+  <rect x="1585" y="938" width="160" height="70" rx="18" fill="#111827" stroke="#334155" stroke-width="2"/>
+  <text x="1665" y="968" text-anchor="middle" class="small" fill="#E2E8F0">scikit-learn</text>
+  <text x="1665" y="993" text-anchor="middle" class="tiny" fill="#CBD5E1">similarity support</text>
+</svg>

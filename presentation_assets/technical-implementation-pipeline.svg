@@ -1,0 +1,115 @@
+<svg width="1920" height="780" viewBox="0 0 1920 780" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0L12 6L0 12V0Z" fill="#253247"/>
+    </marker>
+    <style>
+      .title { font: 700 26px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .label { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .body { font: 500 18px 'Segoe UI', Arial, sans-serif; fill: #334155; }
+      .small { font: 600 17px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .box { fill: #F8FAFC; stroke: #253247; stroke-width: 2.5; rx: 18; }
+      .soft { fill: #FFF7ED; stroke: #F59E0B; stroke-width: 2.5; rx: 18; }
+      .accent { fill: #FFF1F2; stroke: #E11D48; stroke-width: 3; rx: 18; }
+      .input { fill: #EFF6FF; stroke: #3B82F6; stroke-width: 2.5; rx: 16; }
+      .group { fill: #F8FAFC; stroke: #94A3B8; stroke-width: 2.5; rx: 26; }
+      .arrow { stroke: #253247; stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1920" height="780" fill="#FCFCFD"/>
+
+  <text x="960" y="64" text-anchor="middle" class="title">Technical Implementation Pipeline</text>
+  <text x="960" y="96" text-anchor="middle" class="body">Constrained Relevance Weighting turns personalization into a bounded, auditable summarization pipeline.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="64" y="316" width="176" height="88" class="input"/>
+    <text x="152" y="353" text-anchor="middle" class="label">Input Transcript</text>
+    <text x="152" y="382" text-anchor="middle" class="body">Raw .txt podcast file</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="294" y="252" width="250" height="216" class="box"/>
+    <text x="419" y="291" text-anchor="middle" class="label">1. Transcript</text>
+    <text x="419" y="319" text-anchor="middle" class="label">Preprocessing</text>
+    <text x="419" y="362" text-anchor="middle" class="body">Clean timestamps</text>
+    <text x="419" y="389" text-anchor="middle" class="body">and artifacts</text>
+    <text x="419" y="428" text-anchor="middle" class="body">Split transcript into</text>
+    <text x="419" y="455" text-anchor="middle" class="body">manageable chunks</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="592" y="252" width="284" height="216" class="box"/>
+    <text x="734" y="291" text-anchor="middle" class="label">2. Topic Discovery</text>
+    <text x="734" y="319" text-anchor="middle" class="label">&amp; Classification</text>
+    <text x="734" y="362" text-anchor="middle" class="body">Identify major topics</text>
+    <text x="734" y="389" text-anchor="middle" class="body">using Claude</text>
+    <text x="734" y="428" text-anchor="middle" class="body">Assign each transcript</text>
+    <text x="734" y="455" text-anchor="middle" class="body">chunk to one topic</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="924" y="252" width="250" height="216" class="box"/>
+    <text x="1049" y="291" text-anchor="middle" class="label">3. User Preference</text>
+    <text x="1049" y="319" text-anchor="middle" class="label">Modelling</text>
+    <text x="1049" y="362" text-anchor="middle" class="body">User sets topic</text>
+    <text x="1049" y="389" text-anchor="middle" class="body">importance:</text>
+    <text x="1049" y="428" text-anchor="middle" class="body">High / Medium / Low</text>
+    <text x="1049" y="455" text-anchor="middle" class="body">converted to weights</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1218" y="154" width="404" height="412" class="group"/>
+    <text x="1420" y="196" text-anchor="middle" class="label">4. Summary Generation</text>
+    <text x="1420" y="225" text-anchor="middle" class="small">Three variants for controlled comparison</text>
+
+    <rect x="1260" y="252" width="320" height="84" class="soft"/>
+    <text x="1420" y="286" text-anchor="middle" class="label">4a. Generic Summary</text>
+    <text x="1420" y="314" text-anchor="middle" class="body">Follows source topic proportions</text>
+
+    <rect x="1260" y="364" width="320" height="92" class="soft"/>
+    <text x="1420" y="398" text-anchor="middle" class="label">4b. Unconstrained</text>
+    <text x="1420" y="426" text-anchor="middle" class="label">Personalized Summary</text>
+    <text x="1420" y="450" text-anchor="middle" class="body">Preferences freely override the source</text>
+
+    <rect x="1260" y="484" width="320" height="100" class="accent"/>
+    <text x="1420" y="518" text-anchor="middle" class="label">4c. Constrained</text>
+    <text x="1420" y="546" text-anchor="middle" class="label">Personalized Summary</text>
+    <text x="1420" y="572" text-anchor="middle" class="body">Preferences bounded by ±delta</text>
+    <text x="1420" y="598" text-anchor="middle" class="small">Our proposed method</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1674" y="252" width="226" height="148" class="box"/>
+    <text x="1787" y="291" text-anchor="middle" class="label">5. Evidence</text>
+    <text x="1787" y="319" text-anchor="middle" class="label">Linking</text>
+    <text x="1787" y="360" text-anchor="middle" class="body">Map summary paragraphs</text>
+    <text x="1787" y="387" text-anchor="middle" class="body">to source transcript</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1674" y="438" width="226" height="140" class="box"/>
+    <text x="1787" y="477" text-anchor="middle" class="label">6. Evaluation</text>
+    <text x="1787" y="518" text-anchor="middle" class="body">Faithfulness</text>
+    <text x="1787" y="545" text-anchor="middle" class="body">Claim support</text>
+    <text x="1787" y="572" text-anchor="middle" class="body">Coverage and relevance</text>
+  </g>
+
+  <path d="M240 360H294" class="arrow"/>
+  <path d="M544 360H592" class="arrow"/>
+  <path d="M876 360H924" class="arrow"/>
+  <path d="M1174 360H1260" class="arrow"/>
+
+  <path d="M1174 360C1210 360 1212 294 1260 294" class="arrow"/>
+  <path d="M1174 360C1210 360 1212 410 1260 410" class="arrow"/>
+  <path d="M1174 360C1210 360 1212 534 1260 534" class="arrow"/>
+
+  <path d="M1580 294C1632 294 1628 326 1674 326" class="arrow"/>
+  <path d="M1580 410C1632 410 1628 326 1674 326" class="arrow"/>
+  <path d="M1580 534C1632 534 1628 326 1674 326" class="arrow"/>
+
+  <path d="M1787 400V438" class="arrow"/>
+</svg>

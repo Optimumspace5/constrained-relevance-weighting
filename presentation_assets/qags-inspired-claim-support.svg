@@ -1,0 +1,115 @@
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0L12 6L0 12V0Z" fill="#1F2937"/>
+    </marker>
+    <style>
+      .title { font: 700 52px 'Segoe UI', Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 500 24px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .panelTitle { font: 700 30px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .section { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #0F172A; }
+      .body { font: 500 21px 'Segoe UI', Arial, sans-serif; fill: #334155; }
+      .small { font: 600 18px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .tiny { font: 600 16px 'Segoe UI', Arial, sans-serif; fill: #64748B; }
+      .greenText { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #047857; }
+      .redText { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #B91C1C; }
+      .blueText { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #1D4ED8; }
+      .panel { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 2.5; rx: 26; }
+      .warm { fill: #FFF7ED; stroke: #FDBA74; stroke-width: 2.5; rx: 18; }
+      .cool { fill: #EFF6FF; stroke: #93C5FD; stroke-width: 2.5; rx: 18; }
+      .green { fill: #ECFDF5; stroke: #6EE7B7; stroke-width: 2.5; rx: 18; }
+      .red { fill: #FEF2F2; stroke: #FCA5A5; stroke-width: 2.5; rx: 18; }
+      .darkband { fill: #0F172A; rx: 26; }
+      .arrowLine { stroke: #1F2937; stroke-width: 4; stroke-linecap: round; marker-end: url(#arrow); fill: none; }
+    </style>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#FCFCFD"/>
+
+  <text x="960" y="88" text-anchor="middle" class="title">Claim Support Inspired by QAGS</text>
+  <text x="960" y="128" text-anchor="middle" class="subtitle">We evaluate summaries by checking whether their factual claims are actually supported by transcript evidence.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="72" y="186" width="520" height="734" class="panel"/>
+    <rect x="628" y="186" width="704" height="734" class="panel"/>
+    <rect x="1368" y="186" width="480" height="734" class="panel"/>
+  </g>
+
+  <text x="332" y="240" text-anchor="middle" class="panelTitle">1. What the metric does</text>
+  <text x="980" y="240" text-anchor="middle" class="panelTitle">2. How it works on one example</text>
+  <text x="1608" y="240" text-anchor="middle" class="panelTitle">3. What we compute</text>
+
+  <rect x="116" y="286" width="432" height="120" class="cool"/>
+  <text x="332" y="330" text-anchor="middle" class="section">Purpose</text>
+  <text x="332" y="364" text-anchor="middle" class="body">Measure whether factual statements</text>
+  <text x="332" y="394" text-anchor="middle" class="body">in the summary are grounded in the source</text>
+
+  <rect x="116" y="438" width="432" height="398" class="warm"/>
+  <text x="332" y="478" text-anchor="middle" class="section">Step-by-step</text>
+  <text x="146" y="532" class="body">1. Extract factual claims from summary paragraphs</text>
+  <text x="146" y="590" class="body">2. Compare each claim against transcript evidence</text>
+  <text x="146" y="648" class="body">3. Label each claim as supported or unsupported</text>
+  <text x="146" y="706" class="body">4. Compute the proportion of supported claims</text>
+  <text x="146" y="778" class="tiny">This helps us detect unsupported elaboration and hallucination.</text>
+
+  <rect x="672" y="286" width="616" height="132" class="cool"/>
+  <text x="980" y="326" text-anchor="middle" class="section">Summary paragraph</text>
+  <text x="980" y="362" text-anchor="middle" class="body">“The speaker says AI will affect jobs, but workers can adapt</text>
+  <text x="980" y="392" text-anchor="middle" class="body">by learning new skills over time.”</text>
+
+  <path d="M980 418V474" class="arrowLine"/>
+
+  <rect x="698" y="500" width="256" height="144" class="green"/>
+  <text x="826" y="542" text-anchor="middle" class="section">Claim 1</text>
+  <text x="826" y="578" text-anchor="middle" class="body">AI will affect jobs</text>
+  <text x="826" y="614" text-anchor="middle" class="greenText">Supported</text>
+
+  <rect x="1006" y="500" width="256" height="144" class="red"/>
+  <text x="1134" y="542" text-anchor="middle" class="section">Claim 2</text>
+  <text x="1134" y="578" text-anchor="middle" class="body">Workers can adapt</text>
+  <text x="1134" y="608" text-anchor="middle" class="body">by learning new skills</text>
+  <text x="1134" y="638" text-anchor="middle" class="redText">Unsupported</text>
+
+  <path d="M826 644V710" class="arrowLine"/>
+  <path d="M1134 644V710" class="arrowLine"/>
+
+  <rect x="698" y="736" width="256" height="124" class="green"/>
+  <text x="826" y="778" text-anchor="middle" class="section">Transcript evidence</text>
+  <text x="826" y="812" text-anchor="middle" class="body">The source discusses AI</text>
+  <text x="826" y="842" text-anchor="middle" class="body">changing employment.</text>
+
+  <rect x="1006" y="736" width="256" height="124" class="red"/>
+  <text x="1134" y="778" text-anchor="middle" class="section">Transcript evidence</text>
+  <text x="1134" y="812" text-anchor="middle" class="body">No clear support for the</text>
+  <text x="1134" y="842" text-anchor="middle" class="body">“new skills” detail.</text>
+
+  <rect x="1410" y="290" width="396" height="150" class="green"/>
+  <text x="1608" y="334" text-anchor="middle" class="section">Claim support precision</text>
+  <text x="1608" y="372" text-anchor="middle" class="blueText">supported claims / total claims</text>
+  <text x="1608" y="408" text-anchor="middle" class="body">Example: 1 / 2 = 50%</text>
+
+  <rect x="1410" y="470" width="396" height="180" class="warm"/>
+  <text x="1608" y="514" text-anchor="middle" class="section">Why it matters</text>
+  <text x="1608" y="552" text-anchor="middle" class="body">More precise than giving one</text>
+  <text x="1608" y="584" text-anchor="middle" class="body">overall faithfulness score</text>
+  <text x="1608" y="626" text-anchor="middle" class="body">Better at exposing unsupported</text>
+  <text x="1608" y="658" text-anchor="middle" class="body">details in personalized summaries</text>
+
+  <rect x="1410" y="680" width="396" height="180" class="cool"/>
+  <text x="1608" y="724" text-anchor="middle" class="section">Important clarification</text>
+  <text x="1608" y="762" text-anchor="middle" class="body">This is QAGS-inspired,</text>
+  <text x="1608" y="794" text-anchor="middle" class="body">not paper-faithful QAGS.</text>
+  <text x="1608" y="832" text-anchor="middle" class="tiny">We use claim-level support verification,</text>
+  <text x="1608" y="856" text-anchor="middle" class="tiny">not full question-answer comparison.</text>
+
+  <rect x="180" y="944" width="1560" height="110" class="darkband"/>
+  <text x="960" y="993" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="32" font-weight="700" fill="#F8FAFC">
+    Summary → claims → evidence → supported vs unsupported → final precision score
+  </text>
+  <text x="960" y="1026" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="500" fill="#CBD5E1">
+    This lets us evaluate hallucination risk more directly than relying on a single overall judgment.
+  </text>
+</svg>

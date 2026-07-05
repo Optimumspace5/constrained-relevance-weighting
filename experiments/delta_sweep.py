@@ -35,11 +35,13 @@ from src.summarizers import (
 )
 from src.evaluator import (
     evaluate_faithfulness,
+    evaluate_faithfulness_qa,
     compute_rouge_scores,
     compute_extractive_overlap,
     evaluate_coverage,
     evaluate_relevance,
 )
+from src.evidence import link_evidence
 from src.profiles import PROFILES
 
 
@@ -56,13 +58,15 @@ ALL_EPISODES = [
 ]
 
 
-def evaluate_summary(summary, segments, topics, preferences):
-    """Run all non-faithfulness evaluations on a summary."""
-    rouge = compute_rouge_scores(summary, segments)
-    ext = compute_extractive_overlap(summary, segments)
-    coverage = evaluate_coverage(summary, topics)
-    relevance = evaluate_relevance(summary, preferences, topics)
-    return {
+def evaluate_summary(summary, segments, topics, preferences, include_qags=False):
+    """Run evaluations on a summary. Evidence-links first for accurate coverage."""
+    # Evidence-link to get per-paragraph segments for accurate coverage measurement.
+    linked = link_evidence(summary, segments, topics)
+    rouge = compute_rouge_scores(linked, segments)
+    ext = compute_extractive_overlap(linked, segments)
+    coverage = evaluate_coverage(linked, topics)
+    relevance = evaluate_relevance(linked, preferences, topics)
+    result = {
         "rouge1": rouge["rouge1"],
         "rouge2": rouge["rouge2"],
         "rougeL": rouge["rougeL"],
@@ -75,6 +79,13 @@ def evaluate_summary(summary, segments, topics, preferences):
         "proportion_mae": relevance["proportion_mae"],
         "word_count": summary.metadata.get("word_count", 0),
     }
+    if include_qags:
+        qags = evaluate_faithfulness_qa(linked, segments)
+        result["qags_precision"] = qags["precision"]
+        result["qags_supported"] = qags["supported_claims"]
+        result["qags_total"] = qags["total_claims"]
+        result["qags_unsupported_count"] = len(qags["unsupported"])
+    return result
 
 
 def run_sweep(
@@ -82,6 +93,7 @@ def run_sweep(
     deltas: list[float] = SWEEP_DELTAS,
     profile_name: str = "skewed_high",
     include_faithfulness: bool = False,
+    include_qags: bool = False,
     output_dir: str = "experiments/results",
 ) -> list[dict]:
     """
@@ -123,7 +135,7 @@ def run_sweep(
     print("\nGenerating baseline...")
     baseline = generate_baseline_summary(segments, topics)
     row = {"episode": episode_name, "summary_type": "baseline", "delta": "—"}
-    row.update(evaluate_summary(baseline, segments, topics, preferences))
+    row.update(evaluate_summary(baseline, segments, topics, preferences, include_qags=include_qags))
     if include_faithfulness:
         faith = evaluate_faithfulness(baseline, segments)
         row["faithfulness"] = faith["average_score"]
@@ -133,7 +145,7 @@ def run_sweep(
     print("Generating generic summary...")
     generic = generate_generic_summary(segments, topics)
     row = {"episode": episode_name, "summary_type": "generic", "delta": "—"}
-    row.update(evaluate_summary(generic, segments, topics, preferences))
+    row.update(evaluate_summary(generic, segments, topics, preferences, include_qags=include_qags))
     if include_faithfulness:
         faith = evaluate_faithfulness(generic, segments)
         row["faithfulness"] = faith["average_score"]
@@ -143,7 +155,7 @@ def run_sweep(
     print("Generating unconstrained summary...")
     unconstrained = generate_unconstrained_summary(segments, topics, preferences)
     row = {"episode": episode_name, "summary_type": "unconstrained", "delta": "—"}
-    row.update(evaluate_summary(unconstrained, segments, topics, preferences))
+    row.update(evaluate_summary(unconstrained, segments, topics, preferences, include_qags=include_qags))
     if include_faithfulness:
         faith = evaluate_faithfulness(unconstrained, segments)
         row["faithfulness"] = faith["average_score"]
@@ -154,18 +166,21 @@ def run_sweep(
         print(f"Generating constrained at delta={delta:.2f}...")
         summary = generate_constrained_summary(segments, topics, preferences, delta=delta)
         row = {"episode": episode_name, "summary_type": "constrained", "delta": delta}
-        row.update(evaluate_summary(summary, segments, topics, preferences))
+        row.update(evaluate_summary(summary, segments, topics, preferences, include_qags=include_qags))
         if include_faithfulness:
             faith = evaluate_faithfulness(summary, segments)
             row["faithfulness"] = faith["average_score"]
         results.append(row)
 
     # --- Step 5: print table ---
-    print(f"\n{'Summary':<20} {'Delta':>6} {'ROUGE-1':>8} {'ROUGE-L':>8} {'Ext.Ovlp':>9} {'Coverage':>9} {'Rel.':>6} {'MAE':>7} {'Words':>6}", end="")
+    header = f"{'Summary':<20} {'Delta':>6} {'ROUGE-1':>8} {'ROUGE-L':>8} {'Ext.Ovlp':>9} {'Coverage':>9} {'Rel.':>6} {'MAE':>7} {'Words':>6}"
     if include_faithfulness:
-        print(f" {'Faith':>6}", end="")
-    print()
-    print("-" * (85 + (7 if include_faithfulness else 0)))
+        header += f" {'Faith':>6}"
+    if include_qags:
+        header += f" {'QAGS':>10} {'Unsup.':>7}"
+    print(f"\n{header}")
+    sep_len = 85 + (7 if include_faithfulness else 0) + (18 if include_qags else 0)
+    print("-" * sep_len)
 
     for r in results:
         d = str(r["delta"])
@@ -175,6 +190,9 @@ def run_sweep(
                 f"{r['proportion_mae']:>7.4f} {r['word_count']:>6}")
         if include_faithfulness:
             line += f" {r.get('faithfulness', 0):>6.2f}"
+        if include_qags:
+            qp = f"{r.get('qags_supported', 0)}/{r.get('qags_total', 0)}"
+            line += f" {qp:>10} {r.get('qags_unsupported_count', 0):>7}"
         print(line)
 
     # --- Step 6: save CSV ---
@@ -195,6 +213,7 @@ def run_all_episodes(
     deltas: list[float] = SWEEP_DELTAS,
     profile_name: str = "skewed_high",
     include_faithfulness: bool = False,
+    include_qags: bool = False,
     output_dir: str = "experiments/results",
 ) -> list[dict]:
     """Run the sweep across all episodes and save a combined CSV."""
@@ -205,7 +224,8 @@ def run_all_episodes(
             continue
         results = run_sweep(
             path, deltas=deltas, profile_name=profile_name,
-            include_faithfulness=include_faithfulness, output_dir=output_dir,
+            include_faithfulness=include_faithfulness,
+            include_qags=include_qags, output_dir=output_dir,
         )
         all_results.extend(results)
 
@@ -251,6 +271,11 @@ if __name__ == "__main__":
         help="Include faithfulness evaluation (requires API calls per paragraph)",
     )
     parser.add_argument(
+        "--qags",
+        action="store_true",
+        help="Include QAGS claim-level faithfulness evaluation (tracks unsupported claims)",
+    )
+    parser.add_argument(
         "--output-dir",
         default="experiments/results",
         help="Directory to save CSV results",
@@ -261,6 +286,7 @@ if __name__ == "__main__":
         run_all_episodes(
             profile_name=args.profile,
             include_faithfulness=args.faithfulness,
+            include_qags=args.qags,
             output_dir=args.output_dir,
         )
     else:
@@ -269,5 +295,6 @@ if __name__ == "__main__":
             transcript,
             profile_name=args.profile,
             include_faithfulness=args.faithfulness,
+            include_qags=args.qags,
             output_dir=args.output_dir,
         )
