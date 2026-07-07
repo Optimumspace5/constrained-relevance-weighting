@@ -1,8 +1,16 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 import anthropic
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, UserPreference, SummarySegment, Summary
-from src.config import LLM_MODEL, MAX_SUMMARY_WORDS, MIN_SUMMARY_WORDS, MAX_SUMMARY_WORDS_CEIL, DEFAULT_DELTA
+from src.config import (
+    GENERATION_MODEL,
+    MAX_SUMMARY_WORDS,
+    MIN_SUMMARY_WORDS,
+    MAX_SUMMARY_WORDS_CEIL,
+    DEFAULT_DELTA,
+    API_CONCURRENCY,
+)
 
 load_dotenv()
 client = anthropic.Anthropic()
@@ -137,7 +145,7 @@ def generate_generic_summary(
     # --- Call the API ---
     try:
         response = client.messages.create(
-            model=LLM_MODEL,
+            model=GENERATION_MODEL,
             max_tokens=1500,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
@@ -260,7 +268,7 @@ def generate_unconstrained_summary(
     # --- Call the API ---
     try:
         response = client.messages.create(
-            model=LLM_MODEL,
+            model=GENERATION_MODEL,
             max_tokens=1500,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
@@ -465,7 +473,7 @@ def generate_constrained_summary(
     # --- Call the API ---
     try:
         response = client.messages.create(
-            model=LLM_MODEL,
+            model=GENERATION_MODEL,
             max_tokens=2000,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
@@ -500,6 +508,43 @@ def generate_constrained_summary(
             "sampled_indices": sampled_indices,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Helper: generate all summary variants concurrently
+# ---------------------------------------------------------------------------
+
+def generate_all_summaries(
+    segments: list[TranscriptSegment],
+    topics: list[Topic],
+    preferences: list[UserPreference],
+    delta: float = DEFAULT_DELTA,
+    max_workers: int = API_CONCURRENCY,
+) -> dict[str, Summary]:
+    """
+    Generate baseline + the three API-based summaries, running the three API
+    generators concurrently (they are independent). The baseline uses no API and
+    is produced locally. Concurrency is bounded by max_workers (API_CONCURRENCY).
+
+    Returns a dict: {"baseline", "generic", "unconstrained", "constrained"}.
+    """
+    baseline = generate_baseline_summary(segments, topics)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            "generic": executor.submit(generate_generic_summary, segments, topics),
+            "unconstrained": executor.submit(
+                generate_unconstrained_summary, segments, topics, preferences
+            ),
+            "constrained": executor.submit(
+                generate_constrained_summary, segments, topics, preferences, delta
+            ),
+        }
+        # .result() re-raises any exception from the worker thread.
+        results = {name: fut.result() for name, fut in futures.items()}
+
+    results["baseline"] = baseline
+    return results
 
 
 # ---------------------------------------------------------------------------

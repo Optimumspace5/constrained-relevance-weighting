@@ -7,5 +7,10 @@ python-dotenv
 rouge-score
 # for TF-IDF evidence linking (non-LLM similarity matching)
 scikit-learn
+# for the local NLI faithfulness judge (src/nli_judge.py): HF model + torch backend
+transformers
+torch
+# required by the DeBERTa-v3 tokenizer the NLI judge loads
+sentencepiece
 # for unit tests
 pytest

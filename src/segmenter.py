@@ -1,8 +1,11 @@
 import json
+import os
+import hashlib
+from dataclasses import asdict
 import anthropic
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic
-from src.config import LLM_MODEL, NUM_TOPICS
+from src.config import BULK_MODEL, NUM_TOPICS
 # Does two things
 #1. Discover topics - what are the 8 main themes in this podcast
 #2. Classify segments - which segments does each chunk belong to
@@ -57,8 +60,9 @@ def discover_topics(segments: list[TranscriptSegment], num_topics: int = NUM_TOP
     # --- Call the API ---
     try:
         response = client.messages.create(
-            model=LLM_MODEL,
+            model=BULK_MODEL,
             max_tokens=1024,
+            temperature=0,   # deterministic topic discovery
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
@@ -121,8 +125,9 @@ def classify_segments(
         # --- Call the API ---
         try:
             response = client.messages.create(
-                model=LLM_MODEL,
+                model=BULK_MODEL,
                 max_tokens=1024,
+                temperature=0,   # deterministic classification
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = response.content[0].text.strip()
@@ -172,20 +177,65 @@ def classify_segments(
 
 
 # ---------------------------------------------------------------------------
-# 3. segment_transcript  (main orchestrator)
+# 3. segment_transcript  (main orchestrator, with disk cache)
 # ---------------------------------------------------------------------------
+
+# Segmentation (topic discovery + classification) is the most expensive API
+# stage and its output is deterministic for a given transcript, so we cache it
+# to disk keyed by a hash of the transcript content + num_topics. `cache/` is
+# gitignored. Pass force_refresh=True to bypass the cache and recompute.
+CACHE_DIR = "cache"
+
+
+def _segmentation_key(segments: list[TranscriptSegment], num_topics: int) -> str:
+    """Stable hash of the transcript text + num_topics — the cache key."""
+    h = hashlib.sha256()
+    for seg in segments:
+        h.update(seg.text.encode("utf-8"))
+        h.update(b"\x00")
+    h.update(str(num_topics).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cache_path(key: str) -> str:
+    return os.path.join(CACHE_DIR, f"segmentation_{key}.json")
+
+
+def _load_cached_topics(path: str) -> list[Topic]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return [Topic(**t) for t in data]
+
+
+def _save_topics(path: str, topics: list[Topic]) -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([asdict(t) for t in topics], f)
+
 
 def segment_transcript(
     segments: list[TranscriptSegment],
     num_topics: int = NUM_TOPICS,
+    force_refresh: bool = False,
 ) -> list[Topic]:
     """
     Orchestrates the full topic-discovery and classification pipeline.
+
+    Results are cached to disk keyed by transcript hash. On a cache hit the
+    cached topics are returned without any API calls. Pass force_refresh=True to
+    ignore the cache and recompute (then overwrite it).
 
     1. Calls discover_topics to get topic names + descriptions from Claude.
     2. Calls classify_segments to assign every segment to a topic.
     3. Prints a summary and returns the list of Topic objects.
     """
+    key = _segmentation_key(segments, num_topics)
+    path = _cache_path(key)
+
+    if not force_refresh and os.path.exists(path):
+        topics = _load_cached_topics(path)
+        print(f"Loaded cached segmentation ({len(topics)} topics) from {path}")
+        return topics
 
     print(f"Discovering {num_topics} topics from {len(segments)} segments...")
     topic_dicts = discover_topics(segments, num_topics)
@@ -202,6 +252,8 @@ def segment_transcript(
             f"({len(topic.segment_indices)} segments)"
         )
 
+    _save_topics(path, topics)
+    print(f"Cached segmentation to {path}")
     return topics
 
 

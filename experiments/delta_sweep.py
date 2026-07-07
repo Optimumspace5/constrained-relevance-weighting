@@ -21,6 +21,8 @@ Usage:
 import argparse
 import csv
 import os
+import statistics
+from collections import defaultdict
 from datetime import datetime
 
 from src.loader import load_transcript
@@ -88,37 +90,153 @@ def evaluate_summary(summary, segments, topics, preferences, include_qags=False)
     return result
 
 
+def _save_csv(path: str, rows: list[dict]) -> None:
+    """Write rows to CSV using the union of all keys as the header."""
+    if not rows:
+        return
+    fieldnames: list[str] = []
+    for r in rows:
+        for k in r:
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def aggregate_runs(rows: list[dict]) -> list[dict]:
+    """
+    Group rows by config (episode, summary_type, delta) and compute mean + std
+    for every numeric metric across runs. Non-numeric fields and run_id are
+    dropped. Returns one aggregated row per config with `<metric>_mean` /
+    `<metric>_std` columns and an `n_runs` count.
+    """
+    groups: dict = defaultdict(list)
+    for r in rows:
+        groups[(r["episode"], r["summary_type"], r["delta"])].append(r)
+
+    aggregated = []
+    for (episode, summary_type, delta), grp in groups.items():
+        out = {
+            "episode": episode,
+            "summary_type": summary_type,
+            "delta": delta,
+            "n_runs": len(grp),
+        }
+        metric_keys = [
+            k for k in grp[0]
+            if k not in ("episode", "summary_type", "delta", "run_id")
+        ]
+        for k in metric_keys:
+            vals = [
+                r[k] for r in grp
+                if isinstance(r[k], (int, float)) and not isinstance(r[k], bool)
+            ]
+            if len(vals) == len(grp) and vals:
+                out[f"{k}_mean"] = round(statistics.mean(vals), 4)
+                out[f"{k}_std"] = round(statistics.stdev(vals), 4) if len(vals) > 1 else 0.0
+        aggregated.append(out)
+    return aggregated
+
+
+def _print_sweep_table(results, include_faithfulness, include_qags):
+    """Print the detailed per-row table (one line per variant per run)."""
+    header = (f"{'Summary':<20} {'Run':>4} {'Delta':>6} {'ROUGE-1':>8} {'ROUGE-L':>8} "
+              f"{'Ext.Ovlp':>9} {'Coverage':>9} {'Rel.':>6} {'MAE':>7} {'Words':>6}")
+    if include_faithfulness:
+        header += f" {'Faith':>6}"
+    if include_qags:
+        header += f" {'QAGS':>10} {'Unsup.':>7}"
+    print(f"\n{header}")
+    sep_len = 90 + (7 if include_faithfulness else 0) + (18 if include_qags else 0)
+    print("-" * sep_len)
+
+    for r in results:
+        d = str(r["delta"])
+        cov = f"{r['topics_covered']}/{r['total_topics']}"
+        line = (f"{r['summary_type']:<20} {r.get('run_id', 0):>4} {d:>6} {r['rouge1']:>8.4f} "
+                f"{r['rougeL']:>8.4f} {r['extractive_overlap']:>9.4f} {cov:>9} "
+                f"{r['relevance_score']:>6.3f} {r['proportion_mae']:>7.4f} {r['word_count']:>6}")
+        if include_faithfulness:
+            line += f" {r.get('faithfulness', 0):>6.2f}"
+        if include_qags:
+            qp = f"{r.get('qags_supported', 0)}/{r.get('qags_total', 0)}"
+            line += f" {qp:>10} {r.get('qags_unsupported_count', 0):>7}"
+        print(line)
+
+
+def _evaluate_all_variants(
+    episode_name: str,
+    segments,
+    topics,
+    preferences,
+    deltas: list[float],
+    include_faithfulness: bool,
+    include_qags: bool,
+    run_id: int,
+) -> list[dict]:
+    """Generate and evaluate every summary variant once; tag each row with run_id."""
+    rows = []
+
+    def _row(summary_type, delta_label, summary):
+        row = {
+            "episode": episode_name,
+            "summary_type": summary_type,
+            "delta": delta_label,
+            "run_id": run_id,
+        }
+        row.update(evaluate_summary(summary, segments, topics, preferences, include_qags=include_qags))
+        if include_faithfulness:
+            row["faithfulness"] = evaluate_faithfulness(summary, segments)["average_score"]
+        return row
+
+    print(f"\n[run {run_id}] Generating baseline...")
+    rows.append(_row("baseline", "—", generate_baseline_summary(segments, topics)))
+
+    print(f"[run {run_id}] Generating generic summary...")
+    rows.append(_row("generic", "—", generate_generic_summary(segments, topics)))
+
+    print(f"[run {run_id}] Generating unconstrained summary...")
+    rows.append(_row("unconstrained", "—", generate_unconstrained_summary(segments, topics, preferences)))
+
+    for delta in deltas:
+        print(f"[run {run_id}] Generating constrained at delta={delta:.2f}...")
+        summary = generate_constrained_summary(segments, topics, preferences, delta=delta)
+        rows.append(_row("constrained", delta, summary))
+
+    return rows
+
+
 def run_sweep(
     transcript_path: str,
     deltas: list[float] = SWEEP_DELTAS,
     profile_name: str = "skewed_high",
     include_faithfulness: bool = False,
     include_qags: bool = False,
+    runs: int = 1,
     output_dir: str = "experiments/results",
 ) -> list[dict]:
     """
     Run the delta sweep experiment on a single transcript.
 
-    1. Load transcript and discover topics.
-    2. Build preferences from the chosen profile.
-    3. Generate baseline, generic, unconstrained summaries.
-    4. For each delta, generate a constrained summary and evaluate.
-    5. Print comparison table and save to CSV.
+    Load + segment once (segmentation is cached and deterministic), then generate
+    and evaluate every variant `runs` times. Each row is tagged with run_id. When
+    runs > 1, per-config mean and std are also written to a `_agg.csv`, capturing
+    the variance introduced by non-deterministic summary generation.
     """
     episode_name = os.path.splitext(os.path.basename(transcript_path))[0]
 
     print(f"\n{'='*70}")
-    print(f"EPISODE: {episode_name} | Profile: {profile_name}")
+    print(f"EPISODE: {episode_name} | Profile: {profile_name} | Runs: {runs}")
     print(f"{'='*70}")
 
-    # --- Step 1: load and segment ---
     print(f"Loading transcript: {transcript_path}")
     segments = load_transcript(transcript_path)
 
     print("Discovering topics...")
     topics = segment_transcript(segments)
 
-    # --- Step 2: build preferences ---
     ratings = PROFILES[profile_name](topics)
     preferences = create_preferences(topics, ratings)
 
@@ -128,84 +246,30 @@ def run_sweep(
         w = pref_lookup.get(topic.name, 1.0)
         print(f"  {topic.name}: {weight_to_label.get(w, 'medium')} (base={topic.proportion:.1%})")
 
-    # --- Step 3: generate reference summaries ---
+    # Repeat the full variant set `runs` times.
     results = []
+    for run_id in range(runs):
+        results.extend(_evaluate_all_variants(
+            episode_name, segments, topics, preferences, deltas,
+            include_faithfulness, include_qags, run_id,
+        ))
 
-    # Baseline
-    print("\nGenerating baseline...")
-    baseline = generate_baseline_summary(segments, topics)
-    row = {"episode": episode_name, "summary_type": "baseline", "delta": "—"}
-    row.update(evaluate_summary(baseline, segments, topics, preferences, include_qags=include_qags))
-    if include_faithfulness:
-        faith = evaluate_faithfulness(baseline, segments)
-        row["faithfulness"] = faith["average_score"]
-    results.append(row)
+    _print_sweep_table(results, include_faithfulness, include_qags)
 
-    # Generic
-    print("Generating generic summary...")
-    generic = generate_generic_summary(segments, topics)
-    row = {"episode": episode_name, "summary_type": "generic", "delta": "—"}
-    row.update(evaluate_summary(generic, segments, topics, preferences, include_qags=include_qags))
-    if include_faithfulness:
-        faith = evaluate_faithfulness(generic, segments)
-        row["faithfulness"] = faith["average_score"]
-    results.append(row)
-
-    # Unconstrained
-    print("Generating unconstrained summary...")
-    unconstrained = generate_unconstrained_summary(segments, topics, preferences)
-    row = {"episode": episode_name, "summary_type": "unconstrained", "delta": "—"}
-    row.update(evaluate_summary(unconstrained, segments, topics, preferences, include_qags=include_qags))
-    if include_faithfulness:
-        faith = evaluate_faithfulness(unconstrained, segments)
-        row["faithfulness"] = faith["average_score"]
-    results.append(row)
-
-    # --- Step 4: constrained at each delta ---
-    for delta in deltas:
-        print(f"Generating constrained at delta={delta:.2f}...")
-        summary = generate_constrained_summary(segments, topics, preferences, delta=delta)
-        row = {"episode": episode_name, "summary_type": "constrained", "delta": delta}
-        row.update(evaluate_summary(summary, segments, topics, preferences, include_qags=include_qags))
-        if include_faithfulness:
-            faith = evaluate_faithfulness(summary, segments)
-            row["faithfulness"] = faith["average_score"]
-        results.append(row)
-
-    # --- Step 5: print table ---
-    header = f"{'Summary':<20} {'Delta':>6} {'ROUGE-1':>8} {'ROUGE-L':>8} {'Ext.Ovlp':>9} {'Coverage':>9} {'Rel.':>6} {'MAE':>7} {'Words':>6}"
-    if include_faithfulness:
-        header += f" {'Faith':>6}"
-    if include_qags:
-        header += f" {'QAGS':>10} {'Unsup.':>7}"
-    print(f"\n{header}")
-    sep_len = 85 + (7 if include_faithfulness else 0) + (18 if include_qags else 0)
-    print("-" * sep_len)
-
-    for r in results:
-        d = str(r["delta"])
-        cov = f"{r['topics_covered']}/{r['total_topics']}"
-        line = (f"{r['summary_type']:<20} {d:>6} {r['rouge1']:>8.4f} {r['rougeL']:>8.4f} "
-                f"{r['extractive_overlap']:>9.4f} {cov:>9} {r['relevance_score']:>6.3f} "
-                f"{r['proportion_mae']:>7.4f} {r['word_count']:>6}")
-        if include_faithfulness:
-            line += f" {r.get('faithfulness', 0):>6.2f}"
-        if include_qags:
-            qp = f"{r.get('qags_supported', 0)}/{r.get('qags_total', 0)}"
-            line += f" {qp:>10} {r.get('qags_unsupported_count', 0):>7}"
-        print(line)
-
-    # --- Step 6: save CSV ---
+    # Save raw per-run CSV.
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(output_dir, f"sweep_{episode_name}_{profile_name}_{timestamp}.csv")
+    _save_csv(csv_path, results)
+    print(f"\nSaved raw runs: {csv_path}")
 
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
+    # Save mean/std aggregates when there is more than one run.
+    if runs > 1:
+        agg = aggregate_runs(results)
+        agg_path = os.path.join(output_dir, f"sweep_{episode_name}_{profile_name}_{timestamp}_agg.csv")
+        _save_csv(agg_path, agg)
+        print(f"Saved mean/std aggregates: {agg_path}")
 
-    print(f"\nSaved: {csv_path}")
     return results
 
 
@@ -214,9 +278,10 @@ def run_all_episodes(
     profile_name: str = "skewed_high",
     include_faithfulness: bool = False,
     include_qags: bool = False,
+    runs: int = 1,
     output_dir: str = "experiments/results",
 ) -> list[dict]:
-    """Run the sweep across all episodes and save a combined CSV."""
+    """Run the sweep across all episodes and save combined raw + aggregated CSVs."""
     all_results = []
     for path in ALL_EPISODES:
         if not os.path.exists(path):
@@ -225,20 +290,22 @@ def run_all_episodes(
         results = run_sweep(
             path, deltas=deltas, profile_name=profile_name,
             include_faithfulness=include_faithfulness,
-            include_qags=include_qags, output_dir=output_dir,
+            include_qags=include_qags, runs=runs, output_dir=output_dir,
         )
         all_results.extend(results)
 
-    # Save combined CSV.
     if all_results:
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = os.path.join(output_dir, f"sweep_all_episodes_{profile_name}_{timestamp}.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
-            writer.writeheader()
-            writer.writerows(all_results)
+        _save_csv(csv_path, all_results)
         print(f"\nCombined results saved: {csv_path}")
+
+        if runs > 1:
+            agg = aggregate_runs(all_results)
+            agg_path = os.path.join(output_dir, f"sweep_all_episodes_{profile_name}_{timestamp}_agg.csv")
+            _save_csv(agg_path, agg)
+            print(f"Combined mean/std aggregates: {agg_path}")
 
     return all_results
 
@@ -276,6 +343,12 @@ if __name__ == "__main__":
         help="Include QAGS claim-level faithfulness evaluation (tracks unsupported claims)",
     )
     parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Repeat each config N times and report per-metric mean + std (default: 1)",
+    )
+    parser.add_argument(
         "--output-dir",
         default="experiments/results",
         help="Directory to save CSV results",
@@ -287,6 +360,7 @@ if __name__ == "__main__":
             profile_name=args.profile,
             include_faithfulness=args.faithfulness,
             include_qags=args.qags,
+            runs=args.runs,
             output_dir=args.output_dir,
         )
     else:
@@ -296,5 +370,6 @@ if __name__ == "__main__":
             profile_name=args.profile,
             include_faithfulness=args.faithfulness,
             include_qags=args.qags,
+            runs=args.runs,
             output_dir=args.output_dir,
         )
