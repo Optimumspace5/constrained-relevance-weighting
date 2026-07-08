@@ -195,12 +195,12 @@ class Summary:
 | `NUM_TOPICS` | 8 | Topics extracted per episode |
 | `CONSTRAINT_DELTAS` / `DEFAULT_DELTA` | [0.10, 0.15, 0.20] / 0.15 | Constraint bounds |
 | `PREFERENCE_WEIGHTS` | high=1.5, medium=1.0, low=0.5 | Numerical weights |
-| `GENERATION_MODEL` | env, default `claude-sonnet-4-20250514` | Creative summary generation + LLM judge baselines |
-| `BULK_MODEL` | env, default `claude-sonnet-4-20250514` | Mechanical calls: discovery, classification, linking, claim extraction |
+| `GENERATION_MODEL` | env, default `claude-sonnet-4-6` | Creative summary generation + LLM judge baselines |
+| `BULK_MODEL` | env, default `claude-sonnet-4-6` | Mechanical calls: discovery, classification, linking, claim extraction |
 | `API_CONCURRENCY` | env, default 4 | Max concurrent API calls when parallelized |
 | `MIN` / `MAX` / `CEIL` summary words | 800 / 900 / 1000 | Target length band (all variants aim for the 800–1000 word band for a fair comparison) |
 
-The generation/bulk split lets mechanical calls run on a cheaper model (e.g. `BULK_MODEL=claude-haiku-4-5-20251001`) while generation and the judge baselines stay on the stronger model. Defaults are identical, so behavior is unchanged until you opt in.
+The generation/bulk split lets mechanical calls run on a cheaper model (e.g. `BULK_MODEL=claude-haiku-4-5`) while generation and the judge baselines stay on the stronger model. Both default to `claude-sonnet-4-6`, which accepts the `temperature=0` used throughout for determinism — note that Claude Sonnet 5 / Opus 4.7+ reject `temperature`, so moving to them requires dropping those arguments first.
 
 The NLI judge (`src/nli_judge.py`) defaults to `cross-encoder/nli-deberta-v3-base`; `DEFAULT_NLI_MODEL`, the entailment threshold, and the premise word cap are defined there.
 

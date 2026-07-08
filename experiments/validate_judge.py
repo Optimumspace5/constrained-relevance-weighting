@@ -45,6 +45,8 @@ import argparse
 import csv
 import os
 import random
+import shutil
+import textwrap
 
 from src.loader import load_transcript
 from src.segmenter import segment_transcript
@@ -52,7 +54,7 @@ from src.preferences import create_preferences
 from src.summarizers import generate_all_summaries
 from src.evidence import link_evidence, link_evidence_tfidf
 from src.profiles import PROFILES
-from src.nli_judge import load_nli_model, verify_claim
+from src.nli_judge import load_nli_model, verify_claim, build_premise
 # Reuse the evaluator's shared extraction helper on purpose: the validation set
 # must be built from the SAME claim extraction the evaluator uses, or the
 # agreement number would not describe the wired pipeline.
@@ -75,6 +77,7 @@ CSV_COLUMNS = [
     "summary_type",
     "topic",
     "claim",
+    "linked_text",               # the actual premise text the judge sees (label against THIS)
     "linked_segments",           # ';'-joined source segment indices (the judge's premise)
     "my_label",                  # YOU fill this: 'supported' / 'unsupported'
     "judge_label",               # filled by score step
@@ -147,6 +150,9 @@ def _collect_claim_records(
             else:
                 linked = link_evidence_tfidf(summary, segments, topics)
             for seg, claims in _extract_claims(linked):
+                # The exact premise the judge will score this paragraph's claims
+                # against — surfaced in the CSV so you can label against it.
+                premise_text = build_premise(segments, seg.source_segment_indices)
                 for claim in claims:
                     records.append({
                         "episode": episode,
@@ -154,6 +160,7 @@ def _collect_claim_records(
                         "summary_type": summary_type,
                         "topic": seg.topic_name,
                         "claim": claim,
+                        "linked_text": premise_text,
                         "linked_segments": ";".join(str(i) for i in seg.source_segment_indices),
                     })
     return records
@@ -317,6 +324,113 @@ def score_validation_set(
 
 
 # ---------------------------------------------------------------------------
+# Optional: interactive terminal labeler (nicer than a spreadsheet for long
+# premises). Shows one claim + its full evidence at a time and records the
+# verdict YOU type — it never assigns a label itself, and it auto-saves after
+# every row so you can quit ('q') and resume where you left off.
+# ---------------------------------------------------------------------------
+
+def label_validation_set(input_csv: str) -> None:
+    rows = _read_csv(input_csv)
+    if not rows:
+        print(f"No rows in {input_csv}.")
+        return
+
+    width = min(shutil.get_terminal_size((100, 20)).columns, 100)
+    todo = [i for i, r in enumerate(rows) if _norm_label(r.get("my_label", "")) == ""]
+    if not todo:
+        print("Every row already has a my_label. Nothing to do — run the 'score' command.")
+        return
+
+    print(f"{len(todo)} unlabeled of {len(rows)} claims.  "
+          "Keys: s=supported  u=unsupported  k=skip  q=quit&save\n")
+
+    for n, i in enumerate(todo, 1):
+        r = rows[i]
+        print("=" * width)
+        print(f"[{n}/{len(todo)}]  episode={r['episode']}  type={r['summary_type']}  topic={r['topic']}")
+        print("-" * width)
+        print("CLAIM:")
+        print(textwrap.fill(r["claim"], width=width, initial_indent="  ", subsequent_indent="  "))
+        print("\nEVIDENCE (the linked source segments — the premise the judge sees):")
+        evidence = r.get("linked_text", "") or "(no linked evidence)"
+        print(textwrap.fill(evidence, width=width, initial_indent="  ", subsequent_indent="  "))
+        print("-" * width)
+
+        while True:
+            ans = input("supported / unsupported ?  [s/u/k/q]: ").strip().lower()
+            if ans in ("s", "supported"):
+                rows[i]["my_label"] = "supported"
+                break
+            if ans in ("u", "unsupported"):
+                rows[i]["my_label"] = "unsupported"
+                break
+            if ans in ("k", "skip"):
+                break  # leave blank; revisit on a later run
+            if ans in ("q", "quit"):
+                _write_csv(input_csv, rows)
+                print(f"\nSaved progress to {input_csv}. Re-run 'label' to continue.")
+                return
+            print("  Please type s, u, k, or q.")
+
+        _write_csv(input_csv, rows)  # auto-save after every decision
+        print()
+
+    _write_csv(input_csv, rows)
+    print(f"All done. Labels saved to {input_csv}. Next: run the 'score' command.")
+
+
+# ---------------------------------------------------------------------------
+# Optional: read the claims where your label and the judge disagree, so you can
+# diagnose WHY (narrow-premise/linking miss vs. a looser human bar). Reads a
+# scored CSV (my_label + judge_label filled).
+# ---------------------------------------------------------------------------
+
+def inspect_validation_set(input_csv: str) -> None:
+    rows = _read_csv(input_csv)
+    labeled = [r for r in rows if _norm_label(r.get("my_label", "")) in ("supported", "unsupported")]
+    disagreements = [
+        r for r in labeled
+        if r.get("judge_label", "") and _norm_label(r["my_label"]) != r["judge_label"]
+    ]
+    if not labeled or not any(r.get("judge_label", "") for r in labeled):
+        print("No judge labels found — run the 'score' command first (on the labeled CSV).")
+        return
+    if not disagreements:
+        print("No disagreements — the judge matched every label you gave.")
+        return
+
+    def _score(r):
+        try:
+            return float(r.get("judge_entailment_score", ""))
+        except (TypeError, ValueError):
+            return -1.0
+
+    disagreements.sort(key=_score)   # lowest entailment first
+    width = min(shutil.get_terminal_size((100, 20)).columns, 100)
+    print(f"{len(disagreements)} claim(s) where you and the judge disagree "
+          "(sorted by entailment score, lowest first):\n")
+
+    for n, r in enumerate(disagreements, 1):
+        print("=" * width)
+        print(f"[{n}/{len(disagreements)}]  you={_norm_label(r['my_label'])}  "
+              f"judge={r['judge_label']}  entail={r.get('judge_entailment_score', '?')}  "
+              f"({r['summary_type']} / {r['episode']})")
+        print("-" * width)
+        print("CLAIM:")
+        print(textwrap.fill(r["claim"], width=width, initial_indent="  ", subsequent_indent="  "))
+        print("\nEVIDENCE (the premise the judge scored against):")
+        print(textwrap.fill(r.get("linked_text", "") or "(none)", width=width,
+                            initial_indent="  ", subsequent_indent="  "))
+        print()
+
+    print("=" * width)
+    print("For each: is the support (a) in a source segment NOT shown above "
+          "[narrow-premise or bad linking], or (b) not actually stated by any source, "
+          "just plausible/paraphrased [your 'supported' bar was looser than entailment]?")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -335,13 +449,23 @@ if __name__ == "__main__":
                               "or 'llm' (matches the production experiment path)")
     p_build.add_argument("--out", default="experiments/validation/claims.csv")
 
+    p_label = sub.add_parser("label", help="Interactively label claims in the terminal (nicer than a spreadsheet)")
+    p_label.add_argument("--in", dest="input_csv", default="experiments/validation/claims.csv")
+
     p_score = sub.add_parser("score", help="Score a human-labeled CSV with the judge and report")
     p_score.add_argument("--in", dest="input_csv", required=True)
     p_score.add_argument("--out", default="experiments/validation/scored.csv")
 
+    p_inspect = sub.add_parser("inspect", help="Read the claims where you and the judge disagree")
+    p_inspect.add_argument("--in", dest="input_csv", default="experiments/validation/scored.csv")
+
     args = parser.parse_args()
 
-    if args.command == "build":
+    if args.command == "label":
+        label_validation_set(input_csv=args.input_csv)
+    elif args.command == "inspect":
+        inspect_validation_set(input_csv=args.input_csv)
+    elif args.command == "build":
         build_validation_set(
             profile_name=args.profile,
             n_claims=args.n,
