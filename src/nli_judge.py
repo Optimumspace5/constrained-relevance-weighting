@@ -47,11 +47,9 @@ from src.models import TranscriptSegment
 # tradeoff; you can swap this without touching the rest of the module.
 #   - "cross-encoder/nli-deberta-v3-base"                         (smaller, faster)
 #   - "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"  (larger, stronger)
-DEFAULT_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
+DEFAULT_NLI_MODEL = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
 
-# PLACEHOLDER — the value here is NOT an answer. Choosing and justifying this
-# number is part of your task (see the checkpoint question your tutor asked).
-DEFAULT_ENTAILMENT_THRESHOLD = 0.5
+DEFAULT_ENTAILMENT_THRESHOLD = 0.6
 
 # Cap on how many words of premise you feed the model. NLI encoders have a hard
 # max sequence length (often 512 tokens); an over-long premise gets silently
@@ -206,12 +204,10 @@ def verify_claim(
         return {"claim": claim, "entailment_prob": 0.0, "supported": False}
     entailment_prob = score_entailment(premise, claim, model)
     supported = is_supported(entailment_prob, threshold)
-    return {
-        "claim": claim,
-        "entailment_prob": entailment_prob,
-        "supported": supported,
-    }
-    raise NotImplementedError
+    return {"claim": claim, "entailment_prob": entailment_prob, "supported": supported}
+
+
+
 
 
 def verify_claims(
