@@ -195,19 +195,27 @@ def _evaluate_all_variants(
             row["faithfulness"] = evaluate_faithfulness(summary, segments)["average_score"]
         return row
 
+    def _try_variant(summary_type, delta_label, generate):
+        """Generate + evaluate one variant; on any failure, skip it and keep going
+        so a mid-run error (overload, credits, parse) degrades gracefully instead
+        of crashing the whole sweep. Completed variants are still saved."""
+        try:
+            rows.append(_row(summary_type, delta_label, generate()))
+        except Exception as e:
+            print(f"  !! [run {run_id}] {summary_type} (delta={delta_label}) failed — skipping: {e}")
+
     print(f"\n[run {run_id}] Generating baseline...")
-    rows.append(_row("baseline", "—", generate_baseline_summary(segments, topics)))
+    _try_variant("baseline", "—", lambda: generate_baseline_summary(segments, topics))
 
     print(f"[run {run_id}] Generating generic summary...")
-    rows.append(_row("generic", "—", generate_generic_summary(segments, topics)))
+    _try_variant("generic", "—", lambda: generate_generic_summary(segments, topics))
 
     print(f"[run {run_id}] Generating unconstrained summary...")
-    rows.append(_row("unconstrained", "—", generate_unconstrained_summary(segments, topics, preferences)))
+    _try_variant("unconstrained", "—", lambda: generate_unconstrained_summary(segments, topics, preferences))
 
     for delta in deltas:
         print(f"[run {run_id}] Generating constrained at delta={delta:.2f}...")
-        summary = generate_constrained_summary(segments, topics, preferences, delta=delta)
-        rows.append(_row("constrained", delta, summary))
+        _try_variant("constrained", delta, lambda d=delta: generate_constrained_summary(segments, topics, preferences, delta=d))
 
     return rows
 
