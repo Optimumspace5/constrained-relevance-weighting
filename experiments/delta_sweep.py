@@ -43,7 +43,7 @@ from src.evaluator import (
     evaluate_coverage,
     evaluate_relevance,
 )
-from src.evidence import link_evidence
+from src.evidence import link_evidence_tfidf
 from src.profiles import PROFILES
 from src.nli_judge import load_nli_model
 
@@ -63,8 +63,10 @@ ALL_EPISODES = [
 
 def evaluate_summary(summary, segments, topics, preferences, include_qags=False, nli_model=None):
     """Run evaluations on a summary. Evidence-links first for accurate coverage."""
-    # Evidence-link to get per-paragraph segments for accurate coverage measurement.
-    linked = link_evidence(summary, segments, topics)
+    # Deterministic TF-IDF evidence linking: free (no API), reproducible, and it
+    # matches the premise the NLI judge was validated on (so the judge's measured
+    # error rates transfer directly to these results).
+    linked = link_evidence_tfidf(summary, segments, topics)
     rouge = compute_rouge_scores(linked, segments)
     ext = compute_extractive_overlap(linked, segments)
     coverage = evaluate_coverage(linked, topics)
