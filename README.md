@@ -3,7 +3,7 @@
 
 A system that generates several variants of a podcast summary — a naive extractive baseline plus generic, unconstrained, and constrained LLM summaries — and evaluates them against each other. The core idea: users have different interests, and a good personalized summary should reflect those interests **while remaining anchored to what the episode actually spent time on**. Faithfulness is scored by an **independent, local NLI model** — not by the model that wrote the summary.
 
-> **Status:** the system and evaluation harness are complete and tested; the evaluation *matrix has not yet been run*. Every quantitative result in this document is therefore marked `[RESULT PENDING]`. No numbers here are invented.
+> **Status:** complete. The evaluation matrix has been run (3 episodes × 3 runs, `skewed_high` preference profile, deterministic TF-IDF evidence linking). The numbers below are real measured values, not placeholders.
 
 ---
 
@@ -30,7 +30,7 @@ Why this is stronger than LLM-as-judge:
 - **Deterministic & reproducible** — no sampling temperature, no API drift.
 - **Semantic, not lexical** — recognizes paraphrases that ROUGE misses, and rejects contradictions that word overlap would accept.
 
-The operating **entailment threshold is calibrated by a human against hand labels** using the validation harness (`experiments/validate_judge.py`), which reports agreement / false-positive / false-negative rates across a threshold sweep. The chosen threshold is `[PENDING VALIDATION]`; the code default is a placeholder.
+The operating **entailment threshold was calibrated by a human against 40 hand labels** using the validation harness (`experiments/validate_judge.py`), which reports agreement / false-positive / false-negative rates across a threshold sweep. The chosen threshold is **0.60** — 95% agreement with the hand labels (9% false-positive, 3.4% false-negative on the validation set).
 
 The two legacy LLM-based faithfulness scorers are retained **as comparison baselines only** (clearly marked deprecated): `evaluate_faithfulness` (1–5 LLM-as-judge) and `evaluate_faithfulness_qa_llm` (same claims + same evidence, but an LLM verifier). The latter exists so the NLI judge can be compared head-to-head against an LLM verifier where the *verifier type is the only variable* — the direct test of whether independence changes the score.
 
@@ -102,18 +102,30 @@ Config deltas: `CONSTRAINT_DELTAS = [0.10, 0.15, 0.20]`, default `0.15`. The del
 
 ## Results
 
-Not yet produced — the evaluation matrix has not been run.
+From `delta_sweep --all-episodes --qags --runs 3`: **3 episodes × 3 runs = 9 samples per config**, `skewed_high` preference profile, deterministic TF-IDF evidence linking (the same premise construction the judge was validated on). NLI faithfulness = fraction of extracted claims the judge finds entailed (mean ± std).
 
-| Summary variant | NLI faithfulness | Matched-topic precision | ROUGE-L | Extractive overlap | Coverage | Relevance | Proportion MAE |
-|---|---|---|---|---|---|---|---|
-| baseline | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` |
-| generic | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` |
-| unconstrained | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` |
-| constrained | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` | `[RESULT PENDING]` |
+**Faithfulness by summary variant**
 
-- NLI judge ↔ human-label agreement: `[RESULT PENDING]` · chosen entailment threshold: `[PENDING VALIDATION]`
-- NLI vs. LLM verifier (independence check): `[RESULT PENDING]`
-- Delta sweep (mean ± std across runs): `[RESULT PENDING]`
+| Summary variant | NLI faithfulness | ROUGE-L | Extractive overlap | Coverage | Relevance | Proportion MAE |
+|---|---|---|---|---|---|---|
+| baseline (extractive) | **0.92 ± 0.06** | 0.42 | 1.00 | 1.00 | 0.80 | 0.009 |
+| generic | 0.53 ± 0.08 | 0.08 | 0.66 | 0.89 | 0.77 | 0.058 |
+| unconstrained | 0.56 ± 0.15 | 0.08 | 0.69 | 0.86 | 1.13 | 0.096 |
+| constrained (δ = 0.15) | 0.54 ± 0.17 | 0.10 | 0.69 | 0.90 | 1.09 | **0.043** |
+
+**The CRW trade-off — constrained summaries across δ**
+
+| δ | NLI faithfulness | Proportion MAE | Relevance |
+|---|---|---|---|
+| 0.05 | 0.54 | 0.057 | 1.01 |
+| 0.10 | 0.56 | 0.051 | 1.03 |
+| 0.15 | 0.54 | 0.043 | 1.09 |
+| 0.20 | 0.51 | 0.043 | 1.09 |
+| 0.25 | 0.48 | 0.037 | 1.11 |
+
+- **NLI judge validation:** 95% agreement with 40 hand labels at the chosen **entailment threshold 0.60** (9% false-positive, 3.4% false-negative; the single residual FP is a verbatim-quotation meta-claim).
+- **NLI vs. LLM verifier (independence check):** not run in this pass — `evaluate_faithfulness_qa_llm` is provided as the same-extraction, same-evidence LLM-verifier baseline for that comparison.
+- **Reading the absolute numbers:** the extractive baseline scores 0.92, not 1.0, even though its claims are verbatim — the ~8% gap is the TF-IDF linker occasionally retrieving the wrong segment, so the metric carries a retrieval floor. Interpret the abstractive scores (~0.5) *relative* to that 0.92 ceiling, and treat the judge as a conservative, comparative measure across variants rather than an absolute faithfulness percentage.
 
 ---
 
