@@ -1,12 +1,14 @@
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import anthropic
 from rouge_score import rouge_scorer
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, UserPreference, Summary
-from src.config import LLM_MODEL
+from src.config import GENERATION_MODEL, BULK_MODEL, API_CONCURRENCY
+from src.nli_judge import load_nli_model, verify_claims
 
 load_dotenv()
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(max_retries=10)
 
 
 # ---------------------------------------------------------------------------
@@ -18,6 +20,12 @@ def evaluate_faithfulness(
     segments: list[TranscriptSegment],
 ) -> dict:
     """
+    DEPRECATED / OPTIONAL — retained as an LLM-as-judge comparison baseline only.
+    The primary faithfulness metric is now the independent local NLI judge used by
+    evaluate_faithfulness_qa (src/nli_judge.py). This function has Claude grade
+    Claude's own output, so it carries self-consistency bias; it is kept solely so
+    results can be reported against that baseline, not as the headline metric.
+
     Score how well each summary paragraph is supported by the source transcript.
 
     For each paragraph (SummarySegment), we send Claude:
@@ -77,7 +85,7 @@ def evaluate_faithfulness(
 
         try:
             response = client.messages.create(
-                model=LLM_MODEL,
+                model=GENERATION_MODEL,   # LLM-as-judge baseline pinned to the generation model
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -377,52 +385,25 @@ def evaluate_relevance(
 
 
 # ---------------------------------------------------------------------------
-# 4. evaluate_faithfulness_qa  (QAGS-inspired, claim-level)
+# Shared helpers for the claim-level faithfulness evaluators
 # ---------------------------------------------------------------------------
 
-def evaluate_faithfulness_qa(
-    summary: Summary,
-    segments: list[TranscriptSegment],
-) -> dict:
+def _extract_claims(summary: Summary, max_workers: int = API_CONCURRENCY) -> list[tuple]:
     """
-    QA-based faithfulness evaluation inspired by QAGS (Wang, Cho & Lewis, 2020).
+    Shared claim-extraction step for BOTH faithfulness-QA verifiers.
 
-    Instead of asking Claude to subjectively rate faithfulness 1-5, this method:
-    1. Extracts atomic factual claims from each summary paragraph.
-    2. For each claim, generates a yes/no question.
-    3. Answers the question using ONLY the source transcript segments.
-    4. If the source can confirm the claim, it's "supported". Otherwise "unsupported".
+    For each summary paragraph, ask the LLM (BULK_MODEL, temperature=0) for the
+    atomic factual claims it contains. Extraction is the only LLM step the NLI
+    verifier and the LLM-verifier baseline share, so keeping it here guarantees
+    the two are compared on identical claims — the verifier is the only variable.
 
-    This is more stable than LLM-as-judge because the task is constrained:
-    answering factual yes/no questions has far less variance than subjective rating.
-
-    Returns:
-        - total_claims: how many factual claims were extracted
-        - supported_claims: how many were confirmed by the source
-        - precision: supported / total (the faithfulness score)
-        - unsupported: list of claims that could not be verified
-        - per_topic: dict of topic_name → {total, supported, precision}
+    Per-paragraph extraction calls run concurrently, bounded by max_workers, but
+    results are returned in original paragraph order for determinism.
+    Returns a list of (SummarySegment, claims: list[str]).
     """
-    # Use ALL sampled segments for the topic (what the generator actually saw) for verification.
-    # After evidence linking, each paragraph only has 1-3 linked source segments — too few
-    # for reliable claim verification. The generator had access to ALL sampled segments for
-    # the topic, so any faithful paraphrase should be verifiable against that full set.
-    # This is critical for constrained summaries which cover more topics with more claims.
-    sampled_indices_map = summary.metadata.get("sampled_indices", {})
+    segs = list(summary.segments)
 
-    all_claims = []          # list of (claim_text, topic_name, is_supported)
-    per_topic: dict[str, dict] = {}
-
-    for seg in summary.segments:
-        # --- Step 1: Extract atomic claims from this paragraph ---
-        # Primary: all segments the generator saw for this topic.
-        source_indices = list(sampled_indices_map.get(seg.topic_name, []))
-        # Also include evidence-linked indices for additional context.
-        for idx in seg.source_segment_indices:
-            if idx not in source_indices:
-                source_indices.append(idx)
-        source_indices = source_indices[:15]  # cap to avoid prompt overflow
-
+    def extract(seg) -> list[str]:
         extract_prompt = (
             "Extract every distinct factual claim from this summary paragraph. "
             "Each claim should be a single, specific, verifiable statement. "
@@ -430,94 +411,43 @@ def evaluate_faithfulness_qa(
             "Do not include opinions, transitions, or vague statements.\n\n"
             f"PARAGRAPH:\n{seg.text}"
         )
-
         try:
             response = client.messages.create(
-                model=LLM_MODEL,
+                model=BULK_MODEL,
                 max_tokens=512,
+                temperature=0,   # deterministic extraction
                 messages=[{"role": "user", "content": extract_prompt}],
             )
             raw = response.content[0].text.strip()
         except Exception as e:
-            raise RuntimeError(f"API call failed in QAGS claim extraction: {e}") from e
-
+            raise RuntimeError(f"API call failed in claim extraction: {e}") from e
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
-            claims = json.loads(raw)
+            return json.loads(raw)
         except json.JSONDecodeError:
             # If parsing fails, treat the whole paragraph as one claim.
-            claims = [seg.text]
+            return [seg.text]
 
-        if not claims:
-            continue
+    extracted: list = [None] * len(segs)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_i = {executor.submit(extract, seg): i for i, seg in enumerate(segs)}
+        for fut in as_completed(future_to_i):
+            extracted[future_to_i[fut]] = fut.result()
 
-        # --- Step 2: Build source text for verification ---
-        source_blocks = []
-        for idx in source_indices:
-            if idx < len(segments):
-                excerpt = " ".join(segments[idx].text.split()[:200])
-                source_blocks.append(f"[Segment {idx}]: {excerpt}")
-        source_text = "\n\n".join(source_blocks) if source_blocks else "(no source segments)"
+    return [(segs[i], extracted[i]) for i in range(len(segs))]
 
-        # --- Step 3: Verify each claim against the source ---
-        # Batch all claims into one API call for efficiency.
-        claims_numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(claims))
 
-        verify_prompt = (
-            "For each numbered claim below, determine whether it is SUPPORTED or UNSUPPORTED "
-            "based ONLY on the source transcript excerpts provided. "
-            "A claim is SUPPORTED if the source contains evidence that directly confirms it. "
-            "A claim is UNSUPPORTED if the source does not contain enough evidence to confirm it, "
-            "even if you personally know it to be true from other sources. "
-            "Return ONLY a JSON array of objects with 'claim_index' (int, 1-based) "
-            "and 'verdict' (string: 'supported' or 'unsupported'). No other text.\n\n"
-            f"CLAIMS:\n{claims_numbered}\n\n"
-            f"SOURCE TRANSCRIPT EXCERPTS:\n{source_text}"
-        )
-
-        try:
-            response = client.messages.create(
-                model=LLM_MODEL,
-                max_tokens=512,
-                messages=[{"role": "user", "content": verify_prompt}],
-            )
-            raw = response.content[0].text.strip()
-        except Exception as e:
-            raise RuntimeError(f"API call failed in QAGS verification: {e}") from e
-
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            verdicts = json.loads(raw)
-        except json.JSONDecodeError:
-            # If parsing fails, conservatively mark all as unsupported.
-            verdicts = [{"claim_index": i+1, "verdict": "unsupported"} for i in range(len(claims))]
-
-        # Build a lookup of verdicts.
-        verdict_map = {v["claim_index"]: v["verdict"] for v in verdicts}
-
-        # Record results.
-        topic_name = seg.topic_name
-        if topic_name not in per_topic:
-            per_topic[topic_name] = {"total": 0, "supported": 0, "unsupported_claims": []}
-
-        for i, claim in enumerate(claims):
-            verdict = verdict_map.get(i + 1, "unsupported")
-            is_supported = verdict.lower() == "supported"
-            all_claims.append((claim, topic_name, is_supported))
-            per_topic[topic_name]["total"] += 1
-            if is_supported:
-                per_topic[topic_name]["supported"] += 1
-            else:
-                per_topic[topic_name]["unsupported_claims"].append(claim)
-
-    # Compute aggregate scores.
+def _aggregate_claim_results(all_claims: list, per_topic: dict) -> dict:
+    """
+    Fold per-claim (claim, topic, is_supported) tuples + per-topic tallies into
+    the faithfulness-QA return shape. Shared by both verifiers so their outputs
+    are structurally identical.
+    """
     total_claims = len(all_claims)
     supported_claims = sum(1 for _, _, s in all_claims if s)
     precision = supported_claims / total_claims if total_claims > 0 else 0.0
-
     unsupported = [claim for claim, _, s in all_claims if not s]
 
-    # Per-topic precision.
     per_topic_precision = {}
     for topic_name, data in per_topic.items():
         t = data["total"]
@@ -535,6 +465,175 @@ def evaluate_faithfulness_qa(
         "unsupported": unsupported,
         "per_topic": per_topic_precision,
     }
+
+
+# ---------------------------------------------------------------------------
+# 4. evaluate_faithfulness_qa  (claim extraction + NLI verification)
+# ---------------------------------------------------------------------------
+
+def evaluate_faithfulness_qa(
+    summary: Summary,
+    segments: list[TranscriptSegment],
+    nli_model=None,
+) -> dict:
+    """
+    Claim-level faithfulness evaluation (QAGS-style claim extraction + NLI verification).
+
+    Two stages:
+    1. EXTRACTION (LLM, deterministic): atomic factual claims are pulled from each
+       summary paragraph via the Claude API at temperature=0.
+    2. VERIFICATION (local NLI judge): each claim is checked against the source
+       segments the evidence-linking pass already linked to its paragraph, using
+       the independent NLI model in src/nli_judge.py. A claim is "supported" only
+       if the linked source entails it above the judge's threshold.
+
+    Using a separate, local NLI model for verification avoids the self-consistency
+    bias of having Claude grade Claude, and is deterministic and reproducible.
+
+    Args:
+        nli_model: optional preloaded handle from load_nli_model(); if None, the
+            model is loaded here. Pass one in to avoid reloading across summaries.
+
+    Returns:
+        - total_claims: how many factual claims were extracted
+        - supported_claims: how many were confirmed by the source
+        - precision: supported / total (the faithfulness score)
+        - unsupported: list of claims that could not be verified
+        - per_topic: dict of topic_name → {total, supported, precision}
+    """
+    # Load the local NLI judge once and reuse it for every claim (loading the
+    # model is expensive). Callers evaluating several summaries can pass a
+    # preloaded handle via nli_model to avoid reloading each time.
+    if nli_model is None:
+        nli_model = load_nli_model()
+
+    all_claims = []          # list of (claim_text, topic_name, is_supported)
+    per_topic: dict[str, dict] = {}
+
+    # Step 1 (LLM, deterministic, parallel): extract atomic claims per paragraph.
+    for seg, claims in _extract_claims(summary):
+        if not claims:
+            continue
+
+        # ===== EXTRACTION ENDS — LOCAL NLI JUDGE TAKES OVER =====
+        # Step 2 (NLI judge): verify each claim against its linked evidence. The
+        # premise for every claim is the set of source segments the evidence-
+        # linking (or TF-IDF top-k) pass already linked to this paragraph — we
+        # reuse seg.source_segment_indices and build no new retrieval.
+        # verify_claims constructs the premise, scores entailment, and applies the
+        # threshold internally (see src/nli_judge.py); results come back in order.
+        claim_records = [
+            {"claim": c, "source_indices": seg.source_segment_indices}
+            for c in claims
+        ]
+        verification = verify_claims(claim_records, segments, nli_model)
+
+        # Step 3: record results.
+        topic_name = seg.topic_name
+        if topic_name not in per_topic:
+            per_topic[topic_name] = {"total": 0, "supported": 0, "unsupported_claims": []}
+
+        for record in verification["results"]:
+            claim = record["claim"]
+            is_supported = record["supported"]
+            all_claims.append((claim, topic_name, is_supported))
+            per_topic[topic_name]["total"] += 1
+            if is_supported:
+                per_topic[topic_name]["supported"] += 1
+            else:
+                per_topic[topic_name]["unsupported_claims"].append(claim)
+
+    return _aggregate_claim_results(all_claims, per_topic)
+
+
+# ---------------------------------------------------------------------------
+# 4b. evaluate_faithfulness_qa_llm  (DEPRECATED baseline — LLM verifier)
+# ---------------------------------------------------------------------------
+
+def evaluate_faithfulness_qa_llm(
+    summary: Summary,
+    segments: list[TranscriptSegment],
+) -> dict:
+    """
+    DEPRECATED / OPTIONAL baseline — an LLM verifier in place of the NLI judge.
+
+    Identical to evaluate_faithfulness_qa except for the verification step: claims
+    are extracted the same way (shared _extract_claims) and checked against the
+    SAME linked evidence (seg.source_segment_indices), but the verdict comes from
+    the LLM (BULK_MODEL, temperature=0) instead of the local NLI model.
+
+    Kept so the NLI judge can be compared head-to-head against an LLM verifier on
+    identical claims and identical evidence — the verifier is the only variable,
+    which is the direct evidence that the headline NLI number is not inflated by
+    self-consistency bias. Not part of the default pipeline; call it explicitly.
+
+    Returns the same shape as evaluate_faithfulness_qa.
+    """
+    all_claims = []          # list of (claim_text, topic_name, is_supported)
+    per_topic: dict[str, dict] = {}
+
+    for seg, claims in _extract_claims(summary):
+        if not claims:
+            continue
+
+        # Same evidence the NLI judge sees: the linked source segments only.
+        source_blocks = []
+        for idx in seg.source_segment_indices:
+            if idx < len(segments):
+                excerpt = " ".join(segments[idx].text.split()[:200])
+                source_blocks.append(f"[Segment {idx}]: {excerpt}")
+        source_text = "\n\n".join(source_blocks) if source_blocks else "(no source segments)"
+
+        claims_numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(claims))
+        verify_prompt = (
+            "For each numbered claim below, determine whether it is SUPPORTED or UNSUPPORTED "
+            "based ONLY on the source transcript excerpts provided. "
+            "A claim is SUPPORTED if the source contains evidence that directly confirms it. "
+            "A claim is UNSUPPORTED if the source does not contain enough evidence to confirm it, "
+            "even if you personally know it to be true from other sources. "
+            "Return ONLY a JSON array of objects with 'claim_index' (int, 1-based) "
+            "and 'verdict' (string: 'supported' or 'unsupported'). No other text.\n\n"
+            f"CLAIMS:\n{claims_numbered}\n\n"
+            f"SOURCE TRANSCRIPT EXCERPTS:\n{source_text}"
+        )
+
+        try:
+            response = client.messages.create(
+                # Judge baseline pinned to GENERATION_MODEL so the ONLY variable vs.
+                # the NLI judge is verifier *type* — not verifier model strength.
+                model=GENERATION_MODEL,
+                max_tokens=512,
+                temperature=0,   # deterministic verification for a reproducible baseline
+                messages=[{"role": "user", "content": verify_prompt}],
+            )
+            raw = response.content[0].text.strip()
+        except Exception as e:
+            raise RuntimeError(f"API call failed in LLM claim verification: {e}") from e
+
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            verdicts = json.loads(raw)
+        except json.JSONDecodeError:
+            # If parsing fails, conservatively mark all as unsupported.
+            verdicts = [{"claim_index": i + 1, "verdict": "unsupported"} for i in range(len(claims))]
+
+        verdict_map = {v["claim_index"]: v["verdict"] for v in verdicts}
+
+        topic_name = seg.topic_name
+        if topic_name not in per_topic:
+            per_topic[topic_name] = {"total": 0, "supported": 0, "unsupported_claims": []}
+
+        for i, claim in enumerate(claims):
+            verdict = verdict_map.get(i + 1, "unsupported")
+            is_supported = str(verdict).lower() == "supported"
+            all_claims.append((claim, topic_name, is_supported))
+            per_topic[topic_name]["total"] += 1
+            if is_supported:
+                per_topic[topic_name]["supported"] += 1
+            else:
+                per_topic[topic_name]["unsupported_claims"].append(claim)
+
+    return _aggregate_claim_results(all_claims, per_topic)
 
 
 # ---------------------------------------------------------------------------
@@ -563,12 +662,15 @@ def run_full_evaluation(
     summaries["unconstrained"] = unconstrained
     summaries["constrained"] = constrained
 
+    # Load the NLI judge once and reuse it across every summary variant.
+    nli_model = load_nli_model()
+
     results = {}
     for name, summary in summaries.items():
         print(f"  Evaluating {name} summary...")
         faithfulness = evaluate_faithfulness(summary, segments)
-        print(f"    Running QAGS for {name}...")
-        qags         = evaluate_faithfulness_qa(summary, segments)
+        print(f"    Running NLI claim verification for {name}...")
+        qags         = evaluate_faithfulness_qa(summary, segments, nli_model=nli_model)
         rouge        = compute_rouge_scores(summary, segments)
         extractive   = compute_extractive_overlap(summary, segments)
         coverage     = evaluate_coverage(summary, topics)
@@ -583,13 +685,28 @@ def run_full_evaluation(
             "word_count": summary.metadata.get("word_count", 0),
         }
 
+    # --- Matched-topic precision: restrict each variant's claim precision to the
+    # topics that EVERY variant covers, so cross-variant comparison is not skewed
+    # by one variant simply covering more (or fewer) topics than another. ---
+    topic_sets = [set(r["qags"]["per_topic"].keys()) for r in results.values()]
+    matched_topics = sorted(set.intersection(*topic_sets)) if topic_sets else []
+    for r in results.values():
+        pt = r["qags"]["per_topic"]
+        matched_supported = sum(pt[t]["supported"] for t in matched_topics)
+        matched_total = sum(pt[t]["total"] for t in matched_topics)
+        r["qags"]["matched_topics"] = matched_topics
+        r["qags"]["matched_topic_precision"] = (
+            round(matched_supported / matched_total, 3) if matched_total > 0 else 0.0
+        )
+
     # --- Print comparison table ---
     col_w = 15
-    print(f"\n{'Summary Type':<15} {'Faith(1-5)':>{col_w}} {'QAGS Prec.':>{col_w}} {'ROUGE-1':>{col_w}} {'ROUGE-L':>{col_w}} {'Ext. Overlap':>{col_w}} {'Coverage':>{col_w}} {'Relevance':>{col_w}} {'Prop. MAE':>{col_w}} {'Words':>{col_w}}")
-    print("-" * (15 + col_w * 9 + 9))
+    print(f"\n{'Summary Type':<15} {'Faith(1-5)':>{col_w}} {'QAGS Prec.':>{col_w}} {'Match Prec.':>{col_w}} {'ROUGE-1':>{col_w}} {'ROUGE-L':>{col_w}} {'Ext. Overlap':>{col_w}} {'Coverage':>{col_w}} {'Relevance':>{col_w}} {'Prop. MAE':>{col_w}} {'Words':>{col_w}}")
+    print("-" * (15 + col_w * 10 + 10))
     for name, r in results.items():
         faith  = f"{r['faithfulness']['average_score']:.2f} / 5"
         qags_p = f"{r['qags']['supported_claims']}/{r['qags']['total_claims']} ({r['qags']['precision']:.0%})"
+        matchp = f"{r['qags']['matched_topic_precision']:.0%}"
         r1     = f"{r['rouge']['rouge1']:.4f}"
         rl     = f"{r['rouge']['rougeL']:.4f}"
         ext    = f"{r['extractive_overlap']['unigram_overlap']:.4f}"
@@ -597,7 +714,7 @@ def run_full_evaluation(
         rel    = f"{r['relevance']['relevance_score']:.3f}"
         mae    = f"{r['relevance']['proportion_mae']:.4f}"
         words  = str(r["word_count"])
-        print(f"{name:<15} {faith:>{col_w}} {qags_p:>{col_w}} {r1:>{col_w}} {rl:>{col_w}} {ext:>{col_w}} {cov:>{col_w}} {rel:>{col_w}} {mae:>{col_w}} {words:>{col_w}}")
+        print(f"{name:<15} {faith:>{col_w}} {qags_p:>{col_w}} {matchp:>{col_w}} {r1:>{col_w}} {rl:>{col_w}} {ext:>{col_w}} {cov:>{col_w}} {rel:>{col_w}} {mae:>{col_w}} {words:>{col_w}}")
 
     return results
 

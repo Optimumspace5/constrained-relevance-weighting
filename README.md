@@ -1,15 +1,38 @@
 # Constrained Relevance Weighting
-### Personalized Podcast Summarization with Bounded Topic Proportions
+### Personalized Podcast Summarization with Bounded Topic Proportions and an Independent Faithfulness Judge
 
-A system that generates three variants of a podcast summary — generic, unconstrained, and constrained — and evaluates them against each other. The core idea is that users have different interests, and a good personalized summary should reflect those interests while remaining anchored to what the episode actually spent time on.
+A system that generates several variants of a podcast summary — a naive extractive baseline plus generic, unconstrained, and constrained LLM summaries — and evaluates them against each other. The core idea: users have different interests, and a good personalized summary should reflect those interests **while remaining anchored to what the episode actually spent time on**. Faithfulness is scored by an **independent, local NLI model** — not by the model that wrote the summary.
+
+> **Status:** complete. The evaluation matrix has been run (3 episodes × 3 runs, `skewed_high` preference profile, deterministic TF-IDF evidence linking). The numbers below are real measured values, not placeholders.
 
 ---
 
 ## Theoretical Foundation
 
-Standard extractive and abstractive summarization treats all content as equally important. User-preference systems (like those explored in query-focused summarization literature) allow users to weight topics but impose no bound on how far the output can deviate from the source distribution. This creates a failure mode: a minor topic can completely dominate a summary just because a user rated it highly.
+Standard summarization treats all content as equally important. User-preference systems (as in query-focused summarization) let users weight topics but impose no bound on how far the output can deviate from the source distribution. This creates a failure mode: a minor topic can dominate a summary just because a user rated it highly.
 
-**Constrained Relevance Weighting (CRW)** addresses this by introducing a mathematical bound `delta` that limits how far any topic's proportion can shift from its baseline — regardless of the user's expressed preference. The result is a summary that is *personalised but honest*: it reflects user interest while remaining proportionally faithful to what the episode actually discussed.
+**Constrained Relevance Weighting (CRW)** introduces a mathematical bound `delta` that limits how far any topic's proportion can shift from its baseline — regardless of the user's expressed preference. The result is a summary that is *personalized but honest*: it reflects user interest while remaining proportionally faithful to what the episode actually discussed.
+
+---
+
+## The Independent NLI Faithfulness Judge
+
+A personalized summarizer is only useful if its summaries are *faithful* — every claim traceable to the source. The weak point of LLM-as-judge faithfulness scoring is **self-consistency bias**: asking the same model family that wrote the summary to grade it tends to inflate the score.
+
+This project verifies faithfulness with a **separate, local Natural Language Inference (NLI) model** (`src/nli_judge.py`), decoupled from the generator:
+
+- **Claim extraction (LLM, deterministic).** Atomic factual claims are extracted from each summary paragraph via the API at `temperature=0`.
+- **Claim verification (local NLI).** Each claim (the *hypothesis*) is checked against the source segments already linked to its paragraph (the *premise*) using a cross-encoder NLI model (`cross-encoder/nli-deberta-v3-base`). A claim is **supported** only if the premise *entails* it with probability ≥ a chosen threshold.
+
+Why this is stronger than LLM-as-judge:
+
+- **Independent** — a different model family from the generator, so it is not grading its own phrasing.
+- **Deterministic & reproducible** — no sampling temperature, no API drift.
+- **Semantic, not lexical** — recognizes paraphrases that ROUGE misses, and rejects contradictions that word overlap would accept.
+
+The operating **entailment threshold was calibrated by a human against 40 hand labels** using the validation harness (`experiments/validate_judge.py`), which reports agreement / false-positive / false-negative rates across a threshold sweep. The chosen threshold is **0.60** — 95% agreement with the hand labels (9% false-positive, 3.4% false-negative on the validation set).
+
+The two legacy LLM-based faithfulness scorers are retained **as comparison baselines only** (clearly marked deprecated): `evaluate_faithfulness` (1–5 LLM-as-judge) and `evaluate_faithfulness_qa_llm` (same claims + same evidence, but an LLM verifier). The latter exists so the NLI judge can be compared head-to-head against an LLM verifier where the *verifier type is the only variable* — the direct test of whether independence changes the score.
 
 ---
 
@@ -22,64 +45,87 @@ Standard extractive and abstractive summarization treats all content as equally 
 1. load_transcript        — strip timestamps & artifacts, chunk into ~250-word segments
         │
         ▼
-2. segment_transcript     — discover 8 topics via Claude, classify every segment into a topic
+2. segment_transcript     — discover topics + classify segments via the API (deterministic,
+                            temperature=0); result cached to disk by transcript hash
         │
         ▼
-3. get_preferences        — user rates each topic: high (1.5) / medium (1.0) / low (0.5)
+3. create_preferences     — user rates each topic: high (1.5) / medium (1.0) / low (0.5)
         │
-        ├──────────────────────────────────────┐
-        ▼                                      ▼
-4a. generate_generic_summary        4b. generate_unconstrained_summary
-    (mirrors episode proportions)        (preferences fully override proportions)
-        │                                      │
-        └──────────────┬───────────────────────┘
-                       │
-                       ▼
-              4c. generate_constrained_summary
-                   (preferences bounded by ±delta)
-                       │
-                       ▼
-5. link_evidence      — classify each paragraph by topic, link to source segments
-                       │
-                       ▼
-6. evaluate           — faithfulness (LLM-scored), coverage, relevance
+        ├───────────────┬───────────────────────┬───────────────────────┐
+        ▼               ▼                       ▼                       ▼
+4a. baseline     4b. generic           4c. unconstrained        4d. constrained
+   (extractive,     (mirrors episode      (preferences fully       (preferences bounded
+    no LLM)          proportions)          override proportions)    by ±delta)     ← the 3
+        │               │                       │                       │            API
+        └───────────────┴───────────┬───────────┴───────────────────────┘        generators
+                                     │                                          run concurrently
+                                     ▼
+5. link_evidence          — attribute each paragraph to a topic and to its source segments
+   (LLM or TF-IDF top-k)     (this linked set is the NLI judge's premise)
+                                     │
+                                     ▼
+6. evaluate               — NLI faithfulness (primary) + LLM baselines, ROUGE,
+                            extractive overlap, coverage, relevance, matched-topic precision
 ```
 
 ---
 
 ## The Constraint Math
 
-`calculate_constrained_proportions` in `src/summarizers.py` applies the following four-step formula:
+`calculate_constrained_proportions` in `src/summarizers.py` applies:
 
-**Step 1 — Raw target:**
-```
-raw_target = base_proportion × weight
-```
-Where `weight` is 1.5 (high), 1.0 (medium), or 0.5 (low).
+**Step 1 — Raw target:** `raw_target = base_proportion × weight` (weight = 1.5 / 1.0 / 0.5).
 
-**Step 2 — Clamp to delta bounds:**
-```
-clamped = max(base − delta, min(raw_target, base + delta))
-```
+**Step 2 — Clamp to delta bounds:** `clamped = max(base − delta, min(raw_target, base + delta))`.
 
-**Step 3 — Enforce minimum floor:**
-```
-clamped = max(clamped, 0.01)
-```
-Every topic receives at least 1% coverage regardless of preference.
+**Step 3 — Enforce floor:** `clamped = max(clamped, 0.01)` — every topic keeps at least 1%.
 
-**Step 4 — Normalize to sum to 1.0:**
-```
-constrained_proportion[topic] = clamped[topic] / Σ clamped[all topics]
-```
+**Step 4 — Normalize to 1.0** via iterative projection that re-clamps after each rescale, so normalization cannot push any topic outside its `±delta` bound (verified by `tests/test_proportions.py`).
 
-**Concrete example** (delta = 0.15):
-| Topic | Base | Weight | Raw target | Clamped | After normalization |
-|---|---|---|---|---|---|
-| Topic A | 0.40 | 1.5 (high) | 0.60 | 0.55 | higher |
-| Topic B | 0.10 | 0.5 (low) | 0.05 | 0.01 (floor) | lower |
+Config deltas: `CONSTRAINT_DELTAS = [0.10, 0.15, 0.20]`, default `0.15`. The delta sweep experiment scans `[0.05, 0.10, 0.15, 0.20, 0.25]`.
 
-Three delta values are defined in config for experimentation: `[0.10, 0.15, 0.20]`. The default is `0.15`.
+---
+
+## Evaluation Metrics
+
+| Metric | What it measures | LLM? |
+|---|---|---|
+| **NLI faithfulness** (primary) | Fraction of extracted claims entailed by their linked source; per-topic precision, `matched_topic_precision` (restricted to topics all variants cover), and the list of unsupported claims | Extraction only; verification is local |
+| LLM-verify baseline (optional) | Same claims + evidence, LLM verdict — for the independence comparison | Yes (pinned to the generation model) |
+| LLM-as-judge 1–5 (deprecated) | Legacy subjective faithfulness score | Yes (pinned to the generation model) |
+| ROUGE-1 / 2 / L | n-gram / LCS overlap with the source | No |
+| Extractive overlap | Fraction of summary unigrams/bigrams found in the source | No |
+| Coverage | How many discovered topics appear with substantive content | No |
+| Relevance | Preference-weighted topic-proportion score + proportion MAE vs. target | No |
+
+---
+
+## Results
+
+From `delta_sweep --all-episodes --qags --runs 3`: **3 episodes × 3 runs = 9 samples per config**, `skewed_high` preference profile, deterministic TF-IDF evidence linking (the same premise construction the judge was validated on). NLI faithfulness = fraction of extracted claims the judge finds entailed (mean ± std).
+
+**Faithfulness by summary variant**
+
+| Summary variant | NLI faithfulness | ROUGE-L | Extractive overlap | Coverage | Relevance | Proportion MAE |
+|---|---|---|---|---|---|---|
+| baseline (extractive) | **0.92 ± 0.06** | 0.42 | 1.00 | 1.00 | 0.80 | 0.009 |
+| generic | 0.53 ± 0.08 | 0.08 | 0.66 | 0.89 | 0.77 | 0.058 |
+| unconstrained | 0.56 ± 0.15 | 0.08 | 0.69 | 0.86 | 1.13 | 0.096 |
+| constrained (δ = 0.15) | 0.54 ± 0.17 | 0.10 | 0.69 | 0.90 | 1.09 | **0.043** |
+
+**The CRW trade-off — constrained summaries across δ**
+
+| δ | NLI faithfulness | Proportion MAE | Relevance |
+|---|---|---|---|
+| 0.05 | 0.54 | 0.057 | 1.01 |
+| 0.10 | 0.56 | 0.051 | 1.03 |
+| 0.15 | 0.54 | 0.043 | 1.09 |
+| 0.20 | 0.51 | 0.043 | 1.09 |
+| 0.25 | 0.48 | 0.037 | 1.11 |
+
+- **NLI judge validation:** 95% agreement with 40 hand labels at the chosen **entailment threshold 0.60** (9% false-positive, 3.4% false-negative; the single residual FP is a verbatim-quotation meta-claim).
+- **NLI vs. LLM verifier (independence check):** not run in this pass — `evaluate_faithfulness_qa_llm` is provided as the same-extraction, same-evidence LLM-verifier baseline for that comparison.
+- **Reading the absolute numbers:** the extractive baseline scores 0.92, not 1.0, even though its claims are verbatim — the ~8% gap is the TF-IDF linker occasionally retrieving the wrong segment, so the metric carries a retrieval floor. Interpret the abstractive scores (~0.5) *relative* to that 0.92 ceiling, and treat the judge as a conservative, comparative measure across variants rather than an absolute faithfulness percentage.
 
 ---
 
@@ -87,20 +133,31 @@ Three delta values are defined in config for experimentation: `[0.10, 0.15, 0.20
 
 ```
 constrained-relevance-weighting/
-├── app.py                   # Streamlit demo app
-├── requirements.txt         # anthropic, streamlit, python-dotenv
-├── .env.example             # ANTHROPIC_API_KEY=your_api_key_here
-├── data/
-│   └── episode1.txt         # Sample YouTube auto-generated transcript
-└── src/
-    ├── models.py            # Dataclasses: TranscriptSegment, Topic, UserPreference, SummarySegment, Summary
-    ├── config.py            # Constants: NUM_TOPICS, CONSTRAINT_DELTAS, DEFAULT_DELTA, PREFERENCE_WEIGHTS, LLM_MODEL, MAX_SUMMARY_WORDS
-    ├── loader.py            # Transcript loading and preprocessing
-    ├── segmenter.py         # Topic discovery and segment classification via Claude API
-    ├── preferences.py       # User preference collection (CLI and programmatic)
-    ├── summarizers.py       # Three summary generators + calculate_constrained_proportions
-    ├── evidence.py          # Paragraph-level evidence linking and report formatting
-    └── evaluator.py         # Faithfulness, coverage, and relevance evaluation
+├── app.py                       # Streamlit demo app
+├── requirements.txt
+├── .env                         # ANTHROPIC_API_KEY=... (gitignored)
+├── cache/                       # disk cache for segmentation (gitignored)
+├── data/transcripts/
+│   ├── episode1.txt             # YouTube auto-generated transcripts (3 episodes)
+│   ├── episode2.txt
+│   └── episode3.txt
+├── src/
+│   ├── models.py                # Dataclasses: TranscriptSegment, Topic, UserPreference, SummarySegment, Summary
+│   ├── config.py                # GENERATION_MODEL / BULK_MODEL (env), API_CONCURRENCY, deltas, weights, word band
+│   ├── loader.py                # Transcript loading, timestamp stripping, chunking
+│   ├── segmenter.py             # Topic discovery + segment classification (cached, deterministic)
+│   ├── preferences.py           # Preference collection (CLI + programmatic)
+│   ├── summarizers.py           # Baseline + 3 generators + calculate_constrained_proportions + generate_all_summaries
+│   ├── evidence.py              # Evidence linking: link_evidence (LLM) and link_evidence_tfidf (deterministic)
+│   ├── profiles.py              # Preset preference patterns for experiments
+│   ├── evaluator.py             # NLI faithfulness + LLM baselines + ROUGE + overlap + coverage + relevance
+│   └── nli_judge.py             # Independent local NLI faithfulness judge
+├── experiments/
+│   ├── delta_sweep.py           # Delta sweep experiment (--runs N → per-config mean ± std)
+│   └── validate_judge.py        # Human-in-the-loop judge validation harness (build → label → score)
+└── tests/
+    ├── test_proportions.py      # Constraint-math unit tests (no API)
+    └── test_nli_judge.py        # NLI judge unit + semantic tests
 ```
 
 ---
@@ -110,34 +167,35 @@ constrained-relevance-weighting/
 ```python
 @dataclass
 class TranscriptSegment:
-    text: str               # cleaned text of this ~250-word chunk
-    start_index: int        # character position in the full transcript
-    end_index: int          # character position end
+    text: str
+    start_index: int          # character position in the full transcript
+    end_index: int
     word_count: int
+    timestamp: str = ""       # source clock timestamp, if available
 
 @dataclass
 class Topic:
-    name: str               # short label, e.g. "Childhood Trauma"
-    description: str        # one-sentence explanation
-    proportion: float       # fraction of transcript words (0.0–1.0)
-    segment_indices: list[int]  # which TranscriptSegments belong to this topic
+    name: str
+    description: str
+    proportion: float         # fraction of transcript words (0.0–1.0)
+    segment_indices: list[int]
 
 @dataclass
 class UserPreference:
     topic_name: str
-    weight: float           # 1.5=high, 1.0=medium, 0.5=low
+    weight: float             # 1.5=high, 1.0=medium, 0.5=low
 
 @dataclass
 class SummarySegment:
-    text: str               # the summary text (paragraph or full)
-    source_segment_indices: list[int]  # traceable back to TranscriptSegments
+    text: str
+    source_segment_indices: list[int]   # traceable back to TranscriptSegments (the judge premise)
     topic_name: str
 
 @dataclass
 class Summary:
     segments: list[SummarySegment]
-    summary_type: str       # "generic", "unconstrained", or "constrained"
-    metadata: dict          # word_count, num_topics, delta, preferences, proportions
+    summary_type: str         # "baseline" | "generic" | "unconstrained" | "constrained"
+    metadata: dict
 ```
 
 ---
@@ -146,126 +204,103 @@ class Summary:
 
 | Constant | Value | Purpose |
 |---|---|---|
-| `NUM_TOPICS` | 8 | Number of topics Claude extracts |
-| `CONSTRAINT_DELTAS` | [0.10, 0.15, 0.20] | Experimental delta conditions |
-| `DEFAULT_DELTA` | 0.15 | Default constraint bound |
+| `NUM_TOPICS` | 8 | Topics extracted per episode |
+| `CONSTRAINT_DELTAS` / `DEFAULT_DELTA` | [0.10, 0.15, 0.20] / 0.15 | Constraint bounds |
 | `PREFERENCE_WEIGHTS` | high=1.5, medium=1.0, low=0.5 | Numerical weights |
-| `LLM_MODEL` | `claude-sonnet-4-20250514` | Claude model used for all API calls |
-| `MAX_SUMMARY_WORDS` | 800 | Target summary length passed to Claude |
+| `GENERATION_MODEL` | env, default `claude-sonnet-4-6` | Creative summary generation + LLM judge baselines |
+| `BULK_MODEL` | env, default `claude-sonnet-4-6` | Mechanical calls: discovery, classification, linking, claim extraction |
+| `API_CONCURRENCY` | env, default 4 | Max concurrent API calls when parallelized |
+| `MIN` / `MAX` / `CEIL` summary words | 800 / 900 / 1000 | Target length band (all variants aim for the 800–1000 word band for a fair comparison) |
+
+The generation/bulk split lets mechanical calls run on a cheaper model (e.g. `BULK_MODEL=claude-haiku-4-5`) while generation and the judge baselines stay on the stronger model. Both default to `claude-sonnet-4-6`, which accepts the `temperature=0` used throughout for determinism — note that Claude Sonnet 5 / Opus 4.7+ reject `temperature`, so moving to them requires dropping those arguments first.
+
+The NLI judge (`src/nli_judge.py`) defaults to `cross-encoder/nli-deberta-v3-base`; `DEFAULT_NLI_MODEL`, the entailment threshold, and the premise word cap are defined there.
 
 ---
 
 ## Setup
 
-**1. Clone and install dependencies:**
+**1. Install dependencies:**
 ```bash
 pip install -r requirements.txt
 ```
+This includes `transformers`, `torch`, and `sentencepiece` for the local NLI judge. The NLI model weights (~a few hundred MB) download automatically on first use and are cached thereafter.
 
 **2. Add your Anthropic API key:**
 ```bash
-cp .env.example .env
-# edit .env and replace with your real key:
+# create .env with:
 # ANTHROPIC_API_KEY=sk-ant-...
+# optional overrides: GENERATION_MODEL=..., BULK_MODEL=..., API_CONCURRENCY=4
 ```
 
-**3. Add transcript files:**
-
-Place YouTube auto-generated `.txt` transcripts in `data/`. The loader handles the YouTube timestamp format:
-```
-0:000 secondsI'm trying not to cry.
-1:031 minute, 3 secondsBut it became a very useful distinction.
-2:582 minutes, 58 secondsTony. I was shocked.
-```
-Chapter heading lines (e.g. `Chapter 2: A Stranger Changed My Life`) are automatically skipped.
+**3. Add transcripts:** place YouTube auto-generated `.txt` transcripts in `data/transcripts/`. The loader handles the YouTube timestamp format and skips chapter-heading lines.
 
 ---
 
 ## Usage
 
-### Streamlit app (recommended)
+### Streamlit app
 ```bash
 streamlit run app.py
 ```
+Upload a transcript → **Discover Topics** (cached; tick "Force re-discovery" to bypass) → set preferences → **Generate Summaries** (the three API variants run concurrently) → view proportions, summaries, evaluation, and the evidence report.
 
-**App flow:**
-1. Upload a `.txt` transcript in the sidebar
-2. Click **Discover Topics** — calls the Claude API to identify 8 topics and classify all segments
-3. Set your preference (high / medium / low) for each topic using the selectboxes
-4. Adjust the **Constraint bound (delta)** slider (0.05–0.25, default 0.15)
-5. Click **Generate Summaries** — generates all three variants in sequence
-6. View the proportion comparison table and read each summary in the three tabs
-7. Expand **Evaluation** to run faithfulness, coverage, and relevance scoring
-8. Expand **Evidence report** to see each paragraph linked to its source transcript excerpts
-
-### CLI — individual modules
-
-Run any module directly to test its stage in isolation:
+### Delta sweep experiment
 ```bash
-# Load and preview transcript
-python -m src.loader
-
-# Discover topics and classify segments
-python -m src.segmenter
-
-# Generate and compare all three summaries
-python -m src.summarizers
-
-# Generate evidence report for constrained summary
-python -m src.evidence
-
-# Run full evaluation with comparison table
-python -m src.evaluator
+python -m experiments.delta_sweep --all-episodes --qags --runs 3
 ```
-Each module's `__main__` block loads `data/transcripts/episode1.txt` and uses hardcoded test preferences (first 2 topics high, next 3 medium, remaining low) to avoid interactive input.
+Repeats each configuration `--runs` times, tags rows with `run_id`, and writes a raw CSV plus a `_agg.csv` of per-config mean ± std. Flags: `--transcript`, `--profile`, `--faithfulness`, `--qags`, `--output-dir`.
+
+### Judge validation harness
+```bash
+# 1. build an UNLABELED sheet of ~40 claims (with their linked premise segments)
+python -m experiments.validate_judge build --n 40 --out experiments/validation/claims.csv
+#    ...fill the my_label column with 'supported' / 'unsupported' by hand...
+# 2. score your labels with the judge and report agreement + threshold sweep
+python -m experiments.validate_judge score --in experiments/validation/claims.csv
+```
+The harness never assigns labels and never picks a threshold — it reports the sweep; you choose. `--link {tfidf,llm}` selects the premise linker (default `tfidf` for reproducible sheets).
+
+### Individual modules
+```bash
+python -m src.loader        # load and preview a transcript
+python -m src.segmenter     # discover topics + classify
+python -m src.summarizers   # generate and compare summaries
+python -m src.evidence      # evidence report for the constrained summary
+python -m src.evaluator     # full evaluation comparison table
+```
+
+### Tests
+```bash
+pytest tests/                       # full suite
+pytest tests/test_nli_judge.py -m "not nli"   # skip the model-download semantic tests
+```
 
 ---
 
 ## What Each File Actually Does
 
-### `src/loader.py`
-Reads a YouTube auto-generated transcript line by line. Strips timestamps using a compiled regex that matches the YouTube format (`M:SS{display_number} [minutes?, ]seconds`), removes sound artifacts (`[music]`, `[snorts]`, etc.), joins all lines into one continuous string, then splits into chunks of ~250 words at sentence boundaries. Returns `list[TranscriptSegment]` with character-position indices into the full text.
-
-### `src/segmenter.py`
-Two-stage Claude pipeline. `discover_topics` samples every other segment (first 80 words each) and asks Claude to identify exactly `NUM_TOPICS` topics as JSON. `classify_segments` processes segments in batches of 10, asking Claude to assign each segment a topic name; proportions are then computed as the fraction of total word count belonging to each topic. Returns `list[Topic]`.
-
-### `src/preferences.py`
-Two modes: `get_preferences_cli` prompts the user interactively in the terminal (with input validation and an Enter=medium default); `create_preferences` accepts a pre-built `dict[topic_name, rating_string]` for programmatic use (Streamlit passes ratings this way). Both return `list[UserPreference]`.
-
-### `src/summarizers.py`
-Three summary generators, each making one Claude API call with `max_tokens=2048`:
-- **Generic**: shows Claude each topic's actual episode proportion; instructs proportional coverage with no user input.
-- **Unconstrained**: shows Claude HIGH/MEDIUM/LOW labels; instructs preferences to fully override proportions. High-rated topics receive up to 5 sample segments; low-rated receive 1.
-- **Constrained**: runs `calculate_constrained_proportions` first, then shows Claude both the original proportion and the bounded target; instructs coverage according to the target. Sample count per topic scales with constrained proportion (≥20% → 5 samples, ≥10% → 3, below → 1).
-
-All three store the same full summary text across one `SummarySegment` per topic at generation time; fine-grained paragraph-level attribution is added later by `link_evidence`.
-
-### `src/evidence.py`
-`link_evidence` splits the summary on double newlines to get paragraphs, asks Claude in one API call to classify each numbered paragraph by topic, then rebuilds the `Summary` with one `SummarySegment` per paragraph — each carrying the topic's `segment_indices`. `format_evidence_report` renders a fixed-width text report showing each paragraph followed by up to 2 source excerpts (first 100 words each).
-
-### `src/evaluator.py`
-Three metrics:
-- **Faithfulness** (`evaluate_faithfulness`): one Claude API call per paragraph. Provides up to 5 source transcript segments spread at first/25%/middle/75%/last positions across the topic (200 words each). Claude scores support 1–5 and describes any unsupported claims.
-- **Coverage** (`evaluate_coverage`): counts how many of the discovered topics appear as `topic_name` in at least one `SummarySegment`. No API calls.
-- **Relevance** (`evaluate_relevance`): `score = Σ(paragraph_count_for_topic × user_weight) / total_paragraphs`. Also checks per-topic alignment: whether high-preference topics received above-average paragraph counts and low-preference topics received below-average. No API calls.
+- **`src/loader.py`** — parses YouTube transcripts (regex timestamp/artifact stripping), joins lines, chunks into ~250-word segments at sentence boundaries; returns `list[TranscriptSegment]`.
+- **`src/segmenter.py`** — `discover_topics` + `classify_segments` (both `BULK_MODEL`, `temperature=0`); `segment_transcript` caches the result to `cache/` keyed by transcript hash, with a `force_refresh` bypass.
+- **`src/preferences.py`** — interactive CLI and programmatic preference collection.
+- **`src/summarizers.py`** — the extractive baseline, three API generators (`GENERATION_MODEL`), `calculate_constrained_proportions`, and `generate_all_summaries` (runs the three generators concurrently).
+- **`src/evidence.py`** — `link_evidence` (LLM paragraph→segment linking) and `link_evidence_tfidf` (deterministic TF-IDF top-k, no API); `format_evidence_report` for human inspection.
+- **`src/profiles.py`** — preset preference patterns (`skewed_high`, `skewed_low`, `balanced`, `alternating`, `one_dominant`, `inverse`).
+- **`src/nli_judge.py`** — the independent NLI judge: premise construction, entailment scoring (softmax over the model's `id2label`), threshold decision, and per-claim verification. Fully unit-tested.
+- **`src/evaluator.py`** — `evaluate_faithfulness_qa` (claim extraction + NLI verification, the primary metric), the two deprecated LLM baselines, ROUGE, extractive overlap, coverage, relevance, and `run_full_evaluation` (which adds `matched_topic_precision`).
+- **`experiments/delta_sweep.py`** — the delta sweep with multi-run mean/std aggregation.
+- **`experiments/validate_judge.py`** — the human-in-the-loop judge validation harness.
 
 ---
 
 ## Known Limitations
 
-**Topic assignment is single-label.** Each segment is assigned to exactly one topic. Segments that span multiple topics are attributed to whichever Claude chose, which can distort proportions.
-
-**Proportion math is word-count-based.** Topic proportions reflect how many words were assigned to a topic, not how semantically central it was to the episode. A topic that appears briefly but intensely may be underweighted.
-
-**Evidence linking is coarse.** `source_segment_indices` on a `SummarySegment` contains all segments for the matched topic — not just the segments that actually informed that specific paragraph. The link is a topic-level attribution, not a sentence-level one.
-
-**Faithfulness evaluation uses the same model that generated the summary.** `claude-sonnet-4-20250514` evaluating its own output may exhibit self-consistency bias, scoring its own summaries more favourably than an independent judge would.
-
-**The 800-word target is a soft instruction.** Claude treats `MAX_SUMMARY_WORDS` as a target, not a hard limit. Actual word counts vary.
-
-**No speaker diarization.** The loader strips all timestamps but cannot distinguish between host and guest speech. Topic proportions reflect total transcript content, not per-speaker content.
-
-**Transcript format is YouTube-specific.** The timestamp regex is designed for YouTube's auto-generated caption format. Other transcript formats (e.g. Descript, Rev, AssemblyAI) will not parse correctly without modification.
+- **Faithfulness verification is independent, but extraction is not.** Claim *extraction* still uses the LLM; only *verification* is independent. Extraction is deterministic (`temperature=0`) but shares the generator's model family.
+- **Narrow premise.** The judge verifies each claim against only the segments linked to its paragraph. This is the correct regime for a cross-encoder NLI model (long premises dilute the entailment signal and risk silent truncation), but it can raise false negatives when a claim's support is spread across unlinked segments. Since false negatives are the safe error for a faithfulness metric, this is an acceptable, defensible trade — but it should be spot-checked during validation.
+- **Validation vs. production linking.** The validation harness defaults to deterministic TF-IDF linking for reproducible ground truth, while the app/experiment path links via the LLM. A threshold calibrated on TF-IDF premises transfers to the LLM path only insofar as the two linkers surface similar evidence — a cheap spot-check is recommended before trusting transfer.
+- **Single-label topic assignment; word-count-based proportions.** Each segment is assigned to one topic, and proportions reflect word counts, not semantic centrality.
+- **Soft word band.** The 800–1000 word band is a prompt instruction, not a hard limit; actual counts vary.
+- **YouTube-specific transcript format** and **no speaker diarization.**
 
 ---
 
@@ -273,11 +308,12 @@ Three metrics:
 
 | Component | Library |
 |---|---|
-| LLM | Anthropic Claude (`claude-sonnet-4-20250514`) via `anthropic` Python SDK |
+| Generation & LLM-judge baselines | Anthropic Claude via `anthropic` |
+| Faithfulness judge | `transformers` + `torch` (`cross-encoder/nli-deberta-v3-base`), `sentencepiece` tokenizer |
+| Non-LLM metrics | `rouge-score`, `scikit-learn` (TF-IDF) |
 | Web app | `streamlit` |
-| Environment | `python-dotenv` |
+| Environment / tests | `python-dotenv`, `pytest` |
 | Data structures | Python `dataclasses` (stdlib) |
-| Text processing | `re` (stdlib), `json` (stdlib) |
 
 ---
 

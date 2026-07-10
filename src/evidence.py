@@ -4,10 +4,10 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 from src.models import TranscriptSegment, Topic, Summary, SummarySegment
-from src.config import LLM_MODEL
+from src.config import BULK_MODEL
 
 load_dotenv()
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(max_retries=10)
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ def link_evidence(
 
     try:
         response = client.messages.create(
-            model=LLM_MODEL,
+            model=BULK_MODEL,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -127,7 +127,7 @@ def link_evidence(
 
             try:
                 link_response = client.messages.create(
-                    model=LLM_MODEL,
+                    model=BULK_MODEL,
                     max_tokens=256,
                     messages=[{"role": "user", "content": link_prompt}],
                 )

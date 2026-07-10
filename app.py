@@ -10,6 +10,7 @@ from src.summarizers import (
     generate_unconstrained_summary,
     generate_constrained_summary,
     generate_baseline_summary,
+    generate_all_summaries,
     calculate_constrained_proportions,
 )
 from src.evidence import link_evidence, link_evidence_tfidf, format_evidence_report
@@ -66,10 +67,18 @@ with st.sidebar:
     # --- Step 2: discover topics ---
     if "segments" in st.session_state:
         st.divider()
+        force_refresh = st.checkbox(
+            "Force re-discovery (ignore cache)",
+            value=False,
+            help="Segmentation is cached to disk by transcript. Tick to bypass the "
+                 "cache and re-run topic discovery + classification.",
+        )
         if st.button("Discover Topics", use_container_width=True):
             try:
-                with st.spinner("Discovering topics... (this calls the API)"):
-                    st.session_state.topics = segment_transcript(st.session_state.segments)
+                with st.spinner("Discovering topics... (uses cache unless forced)"):
+                    st.session_state.topics = segment_transcript(
+                        st.session_state.segments, force_refresh=force_refresh
+                    )
                 # Clear downstream state when topics are refreshed.
                 for key in ("summaries", "linked_summaries"):
                     st.session_state.pop(key, None)
@@ -133,24 +142,12 @@ with st.sidebar:
                 segments = st.session_state.segments
                 topics = st.session_state.topics
 
-                # Baseline is instant (no API call).
-                baseline = generate_baseline_summary(segments, topics)
-
-                with st.spinner("Generating generic summary..."):
-                    generic = generate_generic_summary(segments, topics)
-
-                with st.spinner("Generating unconstrained summary..."):
-                    unconstrained = generate_unconstrained_summary(segments, topics, preferences)
-
-                with st.spinner("Generating constrained summary..."):
-                    constrained = generate_constrained_summary(segments, topics, preferences, delta=delta)
-
-                st.session_state.summaries = {
-                    "baseline": baseline,
-                    "generic": generic,
-                    "unconstrained": unconstrained,
-                    "constrained": constrained,
-                }
+                # Generate baseline + the three API summaries; the three API
+                # generators run concurrently (bounded by API_CONCURRENCY).
+                with st.spinner("Generating summaries (running in parallel)..."):
+                    st.session_state.summaries = generate_all_summaries(
+                        segments, topics, preferences, delta=delta
+                    )
                 st.session_state.preferences = preferences
                 st.session_state.delta = delta
                 # Clear linked summaries so they're re-derived from the new summaries.
