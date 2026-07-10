@@ -74,11 +74,13 @@ def load_nli_model(model_name: str = DEFAULT_NLI_MODEL):
     Returns:
         An opaque handle consumed by score_entailment.
     """
+    import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name).to(device)
     return tokenizer, model
-    raise NotImplementedError
+
 
 
 def build_premise(
@@ -139,7 +141,7 @@ def score_entailment(premise: str, hypothesis: str, model) -> float:
         Entailment probability in [0.0, 1.0].
     """
     tokenizer, model = model
-    inputs = tokenizer(premise, hypothesis, return_tensors="pt", truncation=True, max_length=512)
+    inputs = tokenizer(premise, hypothesis, return_tensors="pt", truncation=True, max_length=512).to(model.device)
     import torch
     with torch.no_grad():
         outputs = model(**inputs)
