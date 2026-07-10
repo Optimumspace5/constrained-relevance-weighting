@@ -45,6 +45,7 @@ from src.evaluator import (
 )
 from src.evidence import link_evidence
 from src.profiles import PROFILES
+from src.nli_judge import load_nli_model
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ ALL_EPISODES = [
 ]
 
 
-def evaluate_summary(summary, segments, topics, preferences, include_qags=False):
+def evaluate_summary(summary, segments, topics, preferences, include_qags=False, nli_model=None):
     """Run evaluations on a summary. Evidence-links first for accurate coverage."""
     # Evidence-link to get per-paragraph segments for accurate coverage measurement.
     linked = link_evidence(summary, segments, topics)
@@ -82,7 +83,7 @@ def evaluate_summary(summary, segments, topics, preferences, include_qags=False)
         "word_count": summary.metadata.get("word_count", 0),
     }
     if include_qags:
-        qags = evaluate_faithfulness_qa(linked, segments)
+        qags = evaluate_faithfulness_qa(linked, segments, nli_model=nli_model)
         result["qags_precision"] = qags["precision"]
         result["qags_supported"] = qags["supported_claims"]
         result["qags_total"] = qags["total_claims"]
@@ -175,6 +176,7 @@ def _evaluate_all_variants(
     include_faithfulness: bool,
     include_qags: bool,
     run_id: int,
+    nli_model=None,
 ) -> list[dict]:
     """Generate and evaluate every summary variant once; tag each row with run_id."""
     rows = []
@@ -186,7 +188,7 @@ def _evaluate_all_variants(
             "delta": delta_label,
             "run_id": run_id,
         }
-        row.update(evaluate_summary(summary, segments, topics, preferences, include_qags=include_qags))
+        row.update(evaluate_summary(summary, segments, topics, preferences, include_qags=include_qags, nli_model=nli_model))
         if include_faithfulness:
             row["faithfulness"] = evaluate_faithfulness(summary, segments)["average_score"]
         return row
@@ -246,12 +248,16 @@ def run_sweep(
         w = pref_lookup.get(topic.name, 1.0)
         print(f"  {topic.name}: {weight_to_label.get(w, 'medium')} (base={topic.proportion:.1%})")
 
+    # Load the NLI judge ONCE for the whole sweep (reused across every summary,
+    # every delta, every run) instead of reloading it per summary.
+    nli_model = load_nli_model() if include_qags else None
+
     # Repeat the full variant set `runs` times.
     results = []
     for run_id in range(runs):
         results.extend(_evaluate_all_variants(
             episode_name, segments, topics, preferences, deltas,
-            include_faithfulness, include_qags, run_id,
+            include_faithfulness, include_qags, run_id, nli_model=nli_model,
         ))
 
     _print_sweep_table(results, include_faithfulness, include_qags)
