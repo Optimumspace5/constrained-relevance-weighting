@@ -8,7 +8,7 @@ from src.config import GENERATION_MODEL, BULK_MODEL, API_CONCURRENCY
 from src.nli_judge import load_nli_model, verify_claims
 
 load_dotenv()
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(max_retries=10)
 
 
 # ---------------------------------------------------------------------------

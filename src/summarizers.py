@@ -13,7 +13,7 @@ from src.config import (
 )
 
 load_dotenv()
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(max_retries=10)
 
 
 # ---------------------------------------------------------------------------

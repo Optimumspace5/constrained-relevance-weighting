@@ -7,7 +7,7 @@ from src.models import TranscriptSegment, Topic, Summary, SummarySegment
 from src.config import BULK_MODEL
 
 load_dotenv()
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(max_retries=10)
 
 
 # ---------------------------------------------------------------------------

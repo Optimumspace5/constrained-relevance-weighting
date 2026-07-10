@@ -16,7 +16,7 @@ load_dotenv()
 
 # Initialise the Anthropic client once at module level.
 # It automatically reads ANTHROPIC_API_KEY from the environment.
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(max_retries=10)
 
 
 # ---------------------------------------------------------------------------
