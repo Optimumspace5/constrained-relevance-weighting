@@ -124,7 +124,7 @@ From `delta_sweep --all-episodes --qags --runs 3`: **3 episodes × 3 runs = 9 sa
 | 0.25 | 0.48 | 0.037 | 1.11 |
 
 - **NLI judge validation:** 95% agreement with 40 hand labels at the chosen **entailment threshold 0.60** (9% false-positive, 3.4% false-negative; the single residual FP is a verbatim-quotation meta-claim).
-- **NLI vs. LLM verifier (independence check):** not run in this pass — `evaluate_faithfulness_qa_llm` is provided as the same-extraction, same-evidence LLM-verifier baseline for that comparison.
+- **NLI vs. LLM verifier ([independence check](experiments/validation/independence_results.md)):** on identical claims + evidence the two verifiers agree **75%** — genuinely independent, not self-consistency bias — while the NLI judge is *more* accurate against the hand labels (**95% vs 80%**). The disagreements are systematic and interpretable: the LLM over-rejects faithful abstraction, and its only 2 wins are exactly the judge's two documented failure modes (verbatim-quote meta-claim + one over-rejection). Caveat: n=40, and 75% is prompt-dependent — the robust finding is the *direction*, not the ratio.
 - **Reading the absolute numbers:** the extractive baseline scores 0.92, not 1.0, even though its claims are verbatim — the ~8% gap is the TF-IDF linker occasionally retrieving the wrong segment, so the metric carries a retrieval floor. Interpret the abstractive scores (~0.5) *relative* to that 0.92 ceiling, and treat the judge as a conservative, comparative measure across variants rather than an absolute faithfulness percentage.
 
 ---
