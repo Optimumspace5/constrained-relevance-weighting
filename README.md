@@ -22,7 +22,7 @@ A personalized summarizer is only useful if its summaries are *faithful* — eve
 This project verifies faithfulness with a **separate, local Natural Language Inference (NLI) model** (`src/nli_judge.py`), decoupled from the generator:
 
 - **Claim extraction (LLM, deterministic).** Atomic factual claims are extracted from each summary paragraph via the API at `temperature=0`.
-- **Claim verification (local NLI).** Each claim (the *hypothesis*) is checked against the source segments already linked to its paragraph (the *premise*) using a cross-encoder NLI model (`cross-encoder/nli-deberta-v3-base`). A claim is **supported** only if the premise *entails* it with probability ≥ a chosen threshold.
+- **Claim verification (local NLI).** Each claim (the *hypothesis*) is checked against the source segments already linked to its paragraph (the *premise*) using a DeBERTa-v3-large model fine-tuned on NLI datasets including FEVER (`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`). A claim is **supported** only if the premise *entails* it with probability ≥ a chosen threshold.
 
 Why this is stronger than LLM-as-judge:
 
@@ -125,7 +125,7 @@ From `delta_sweep --all-episodes --qags --runs 3`: **3 episodes × 3 runs = 9 sa
 
 - **NLI judge validation:** 95% agreement with 40 hand labels at the chosen **entailment threshold 0.60** (9% false-positive, 3.4% false-negative; the single residual FP is a verbatim-quotation meta-claim).
 - **NLI vs. LLM verifier ([independence check](experiments/validation/independence_results.md)):** on identical claims + evidence the two verifiers agree **75%** — genuinely independent, not self-consistency bias — while the NLI judge is *more* accurate against the hand labels (**95% vs 80%**). The disagreements are systematic and interpretable: the LLM over-rejects faithful abstraction, and its only 2 wins are exactly the judge's two documented failure modes (verbatim-quote meta-claim + one over-rejection). Caveat: n=40, and 75% is prompt-dependent — the robust finding is the *direction*, not the ratio.
-- **Reading the absolute numbers:** the extractive baseline scores 0.92, not 1.0, even though its claims are verbatim — the ~8% gap is the TF-IDF linker occasionally retrieving the wrong segment, so the metric carries a retrieval floor. Interpret the abstractive scores (~0.5) *relative* to that 0.92 ceiling, and treat the judge as a conservative, comparative measure across variants rather than an absolute faithfulness percentage.
+- **Reading the absolute numbers:** the extractive baseline scores 0.92, not 1.0, even though its claims are verbatim. This gap is **not** from TF-IDF mis-linking — the extractive baseline skips evidence linking entirely and carries its own per-topic source indices. It comes from the judge's premise construction: the premise is capped at 400 words (`DEFAULT_MAX_PREMISE_WORDS`) and the baseline's source-segment attribution is approximate, so for some verbatim claims the supporting text is truncated out of, or absent from, the linked premise. Either way the metric carries a **retrieval floor**. Interpret the abstractive scores (~0.5) *relative* to that 0.92 ceiling, and treat the judge as a conservative, comparative measure across variants rather than an absolute faithfulness percentage.
 
 ---
 
@@ -214,7 +214,7 @@ class Summary:
 
 The generation/bulk split lets mechanical calls run on a cheaper model (e.g. `BULK_MODEL=claude-haiku-4-5`) while generation and the judge baselines stay on the stronger model. Both default to `claude-sonnet-4-6`, which accepts the `temperature=0` used throughout for determinism — note that Claude Sonnet 5 / Opus 4.7+ reject `temperature`, so moving to them requires dropping those arguments first.
 
-The NLI judge (`src/nli_judge.py`) defaults to `cross-encoder/nli-deberta-v3-base`; `DEFAULT_NLI_MODEL`, the entailment threshold, and the premise word cap are defined there.
+The NLI judge (`src/nli_judge.py`) defaults to `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli` (a DeBERTa-v3-large model fine-tuned on NLI datasets including FEVER); `DEFAULT_NLI_MODEL`, the entailment threshold, and the premise word cap are defined there.
 
 ---
 
@@ -309,7 +309,7 @@ pytest tests/test_nli_judge.py -m "not nli"   # skip the model-download semantic
 | Component | Library |
 |---|---|
 | Generation & LLM-judge baselines | Anthropic Claude via `anthropic` |
-| Faithfulness judge | `transformers` + `torch` (`cross-encoder/nli-deberta-v3-base`), `sentencepiece` tokenizer |
+| Faithfulness judge | `transformers` + `torch` (`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`), `sentencepiece` tokenizer |
 | Non-LLM metrics | `rouge-score`, `scikit-learn` (TF-IDF) |
 | Web app | `streamlit` |
 | Environment / tests | `python-dotenv`, `pytest` |
