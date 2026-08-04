@@ -1,6 +1,8 @@
 # Constrained Relevance Weighting
 ### Personalized Podcast Summarization with Bounded Topic Proportions and an Independent Faithfulness Judge
 
+> **Built and extended by Clarence Lee.** Originally a four-person academic project; this version is an independent solo continuation — the independent NLI faithfulness judge, its 40-label validation, the independence check, and the multi-run evaluation were all added solo after the module ended. See [Attribution](#attribution).
+
 A system that generates several variants of a podcast summary — a naive extractive baseline plus generic, unconstrained, and constrained LLM summaries — and evaluates them against each other. The core idea: users have different interests, and a good personalized summary should reflect those interests **while remaining anchored to what the episode actually spent time on**. Faithfulness is scored by an **independent, local NLI model** — not by the model that wrote the summary.
 
 > **Status:** complete. The evaluation matrix has been run (3 episodes × 3 runs, `skewed_high` preference profile, deterministic TF-IDF evidence linking). The numbers below are real measured values, not placeholders.
@@ -317,12 +319,11 @@ pytest tests/test_nli_judge.py -m "not nli"   # skip the model-download semantic
 
 ---
 
-## Team
+## Attribution
 
-- Shyuan Rui
-- Clarence Lee
-- Selwyn Ray Oesjadi
-- Benjamin Loo
+Constrained Relevance Weighting began as a four-person academic project (NST2062, NUS) — Clarence Lee, Shyuan Rui, Selwyn Ray Oesjadi, and Benjamin Loo — where the team developed the core CRW concept and the initial pipeline.
+
+**This repository is my (Clarence Lee) solo continuation of that work.** I built the entire implementation, and after the module ended I extended it independently — most substantially by replacing the original LLM-as-judge faithfulness scoring with an independent, local NLI faithfulness judge, validating it against 40 hand-labeled claims, and adding the independence check and multi-run evaluation. All commits are mine (across two GitHub identities: `Clarence Lee` and `Optimumspace5`).
 
 ---
 
